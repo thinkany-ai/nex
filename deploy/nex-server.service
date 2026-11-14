@@ -1,0 +1,25 @@
+# /etc/systemd/system/nex-server.service
+# Put NEX_ADMIN_KEY=... in /etc/nex/env (mode 0600), then:
+#   systemctl daemon-reload && systemctl enable --now nex-server
+[Unit]
+Description=nex relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nex
+EnvironmentFile=/etc/nex/env
+Environment=NEX_LISTEN=127.0.0.1:8080
+Environment=NEX_DB=/var/lib/nex/nex.db
+ExecStart=/usr/local/bin/nex-server
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+StateDirectory=nex
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+# Relay + Caddy (automatic HTTPS). Set NEX_DOMAIN and NEX_ADMIN_KEY in .env.
+services:
+  nex:
+    build: ..
+    restart: unless-stopped
+    environment:
+      NEX_ADMIN_KEY: ${NEX_ADMIN_KEY:?set NEX_ADMIN_KEY}
+    volumes:
+      - nex-data:/var/lib/nex
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: ["80:80", "443:443", "443:443/udp"]
+    command: caddy reverse-proxy --from ${NEX_DOMAIN:?set NEX_DOMAIN} --to nex:8080
+    volumes:
+      - caddy-data:/data
+volumes:
+  nex-data:
+  caddy-data:

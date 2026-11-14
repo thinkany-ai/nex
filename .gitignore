@@ -1,0 +1,30 @@
+# Rust
+/target
+
+# Node (TypeScript SDK)
+node_modules/
+sdk/typescript/dist/
+*.tsbuildinfo
+
+# Go
+*.test
+*.out
+coverage.*
+
+# 本地数据库（中继的 SQLite 及 WAL 文件）
+*.db
+*.db-shm
+*.db-wal
+
+# 本地配置和密钥
+.env
+.env.*
+!.env.example
+
+# 编辑器 / 系统 / 工具
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.log
+.claude/settings.local.json

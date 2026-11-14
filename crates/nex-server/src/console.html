@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nex console</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --fg:#16181d; --muted:#6b7280; --line:#e5e7eb; --accent:#0f766e; --bad:#b91c1c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1115; --card:#181b21; --fg:#e8eaed; --muted:#9aa0a6; --line:#2a2e36; --accent:#2dd4bf; --bad:#f87171; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system, system-ui, sans-serif; }
+  main { max-width:640px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:8px 0 4px; }
+  .muted { color:var(--muted); font-size:13px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin:12px 0; }
+  input, button { font:inherit; border-radius:8px; border:1px solid var(--line); padding:8px 10px; background:var(--card); color:var(--fg); }
+  input { width:100%; margin:4px 0 8px; }
+  button { cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .dev { border-top:1px solid var(--line); padding:10px 0; }
+  .dev:first-child { border-top:0; }
+  .on { color:var(--accent); } .off { color:var(--muted); }
+  pre { background:var(--bg); border-radius:8px; padding:10px; overflow:auto; font-size:12.5px; max-height:320px; white-space:pre-wrap; word-break:break-all; margin:8px 0 0; }
+  .err { color:var(--bad); }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>nex console</h1>
+  <div class="muted">中继：<span id="relay"></span> · 用来测试设备之间能不能互通</div>
+
+  <section id="join" class="card hidden">
+    <b>把这个浏览器加入账号</b>
+    <div class="muted">在已加入的电脑上运行 <code>nex pair</code>，把配对码填到这里。</div>
+    <label>配对码<input id="code" placeholder="ABCD-EFGH" autocapitalize="characters" autocomplete="off"></label>
+    <label>设备名<input id="name" value="phone"></label>
+    <button class="primary" id="joinBtn">加入</button>
+    <div id="joinErr" class="err"></div>
+  </section>
+
+  <section id="main" class="hidden">
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <b>设备</b>
+        <div class="row"><button id="refresh">刷新</button><button id="forget">退出</button></div>
+      </div>
+      <div class="muted" id="me"></div>
+      <div id="devices"></div>
+    </div>
+    <div class="card">
+      <b>日志</b>
+      <pre id="log"></pre>
+    </div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const RELAY = location.origin;
+const KEY = "nex.credential";
+$("relay").textContent = RELAY;
+
+function load() { try { return JSON.parse(localStorage.getItem(KEY)); } catch { return null; } }
+function save(c) { try { localStorage.setItem(KEY, JSON.stringify(c)); } catch {} }
+let cred = load();
+
+function log(line, cls) {
+  const el = document.createElement("div");
+  el.textContent = `${new Date().toLocaleTimeString()}  ${line}`;
+  if (cls) el.className = cls;
+  $("log").prepend(el);
+}
+
+async function api(method, path, body, auth = true) {
+  const headers = { "Content-Type": "application/json" };
+  if (auth) headers.Authorization = `Bearer ${cred.device_token}`;
+  const res = await fetch(RELAY + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`${res.status} ${data.error || res.statusText}`);
+  return data;
+}
+
+function show() {
+  $("join").classList.toggle("hidden", !!cred);
+  $("main").classList.toggle("hidden", !cred);
+  if (cred) refresh();
+}
+
+$("joinBtn").onclick = async () => {
+  $("joinErr").textContent = "";
+  try {
+    cred = await api("POST", "/v1/devices/claim", { code: $("code").value, device_name: $("name").value }, false);
+    save(cred);
+    show();
+  } catch (e) { $("joinErr").textContent = e.message; }
+};
+$("forget").onclick = () => { try { localStorage.removeItem(KEY); } catch {} cred = null; show(); };
+$("refresh").onclick = () => refresh();
+
+async function refresh() {
+  try {
+    const { devices } = await api("GET", "/v1/devices");
+    const list = $("devices");
+    list.replaceChildren();
+    for (const d of devices) {
+      if (d.is_self) { $("me").textContent = `本机：${d.name} (${d.id})`; continue; }
+      const row = document.createElement("div");
+      row.className = "dev";
+      const title = document.createElement("div");
+      title.innerHTML = `<b></b> <span></span>`;
+      title.children[0].textContent = d.name;
+      title.children[1].textContent = d.online ? "在线" : "离线";
+      title.children[1].className = d.online ? "on" : "off";
+      row.append(title);
+      const svc = document.createElement("div");
+      svc.className = "muted";
+      svc.textContent = d.services.length ? d.services.map((s) => `${s.name}(${s.kind})`).join(" ") : "没有暴露服务";
+      row.append(svc);
+      if (d.online && d.services.some((s) => s.name === "echo")) {
+        const btns = document.createElement("div");
+        btns.className = "row";
+        btns.style.marginTop = "6px";
+        const b1 = document.createElement("button");
+        b1.textContent = "Ping ×10";
+        b1.onclick = () => ping(d, 10);
+        btns.append(b1);
+        row.append(btns);
+      }
+      list.append(row);
+    }
+    if (!list.children.length) list.innerHTML = `<div class="muted">还没有其他设备</div>`;
+  } catch (e) {
+    log(`刷新失败：${e.message}`, "err");
+    if (e.message.startsWith("401")) log("凭证无效或已被吊销，点“退出”后重新配对", "err");
+  }
+}
+
+function openStream(device, service) {
+  return api("POST", "/v1/tickets", { device: device.id, service }).then((t) => {
+    const url = new URL(t.path, RELAY);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    return new WebSocket(url);
+  });
+}
+
+async function ping(device, count) {
+  const t0 = performance.now();
+  let ws;
+  try { ws = await openStream(device, "echo"); } catch (e) { return log(`${device.name}: ${e.message}`, "err"); }
+  const rtts = [];
+  let seq = 0, sentAt = 0, done = false;
+  const next = () => {
+    if (seq >= count) { done = true; ws.close(); return summary(); }
+    sentAt = performance.now();
+    ws.send(`web-ping ${seq}`);
+  };
+  const summary = () => {
+    if (!rtts.length) return;
+    const avg = rtts.reduce((a, b) => a + b, 0) / rtts.length;
+    log(`${device.name}: ${rtts.length} 次  min ${Math.min(...rtts).toFixed(1)} / avg ${avg.toFixed(1)} / max ${Math.max(...rtts).toFixed(1)} ms`);
+  };
+  ws.onopen = () => { log(`${device.name}/echo 已连接，用时 ${(performance.now() - t0).toFixed(0)} ms`); next(); };
+  ws.onmessage = (ev) => {
+    if (ev.data !== `web-ping ${seq}`) return;
+    const rtt = performance.now() - sentAt;
+    rtts.push(rtt);
+    log(`${device.name}: seq=${seq} rtt=${rtt.toFixed(1)} ms`);
+    seq++;
+    setTimeout(next, 300);
+  };
+  ws.onclose = (ev) => {
+    if (!done) log(`${device.name}: 连接关闭 ${ev.code} ${ev.reason || ""}`, "err");
+  };
+  ws.onerror = () => log(`${device.name}: WebSocket 出错`, "err");
+}
+
+show();
+</script>
+</body>
+</html>

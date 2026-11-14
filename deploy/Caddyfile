@@ -1,0 +1,12 @@
+# TLS in front of the relay. Caddy gets and renews the certificate itself.
+# WebSocket upgrades are proxied automatically.
+nex.example.com {
+	reverse_proxy 127.0.0.1:8080 {
+		# Long-lived streams: never cut idle WebSockets at the proxy.
+		transport http {
+			read_timeout 0
+			write_timeout 0
+		}
+		flush_interval -1
+	}
+}

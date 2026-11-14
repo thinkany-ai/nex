@@ -1,0 +1,9 @@
+[package]
+name = "nex-proto"
+description = "Wire types shared by the nex relay and its clients"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
