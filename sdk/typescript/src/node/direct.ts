@@ -475,6 +475,11 @@ export class DirectPaths extends EventEmitter<{ change: [PathStatus] }> {
     });
   }
 
+  /** Re-measures every known path now (e.g. right after pairing changed on the other side). */
+  probe(): Promise<void> {
+    return this.#probeAll();
+  }
+
   status(): PathStatus {
     const best = this.#best();
     return {
@@ -506,7 +511,7 @@ export class DirectPaths extends EventEmitter<{ change: [PathStatus] }> {
       best.error = message;
       this.#changed();
       // A rejected key means the host restarted (new keys) or forgot us.
-      if (isAuthFailure(message)) void this.#discover();
+      if (isAuthFailure(message) && !this.#trust()) void this.#discover();
       else setTimeout(() => void this.#probeAll(), 1_000).unref?.();
       return null;
     }
@@ -607,16 +612,24 @@ export class DirectPaths extends EventEmitter<{ change: [PathStatus] }> {
           } catch (err) {
             p.setupMs = null;
             p.error = errText(err);
-            if (isAuthFailure(p.error)) authFailed = true;
+            if (isAuthFailure(p.error)) {
+              authFailed = true;
+              if (this.#trust()) p.error = "the device has not paired with this one (or its key changed)";
+            }
           }
         }),
       );
       if (JSON.stringify(this.status()) !== before) this.#changed();
       if (!this.#running) return;
-      if (authFailed) return void setTimeout(() => void this.#discover(), 0).unref?.();
+      // A rejected relay-issued key means the host restarted (new keys): fetch
+      // a fresh one right away. A rejected PAIRED key is the user's to fix
+      // (the other side has not paired yet), so it only gets the slow retry.
+      const staleRelayKey = authFailed && !this.#trust() && !!this.#client;
       // Nothing answers: the host may have restarted on new ports or moved
       // networks. Ask it again, backing off so an unreachable host stays cheap.
-      if (this.#paths.every((p) => p.setupMs === null)) {
+      if (staleRelayKey && Date.now() - this.#lastDiscovery >= 1_000) {
+        void this.#discover();
+      } else if (this.#paths.every((p) => p.setupMs === null)) {
         if (Date.now() - this.#lastDiscovery >= this.#rediscoverAfter) {
           this.#rediscoverAfter = Math.min(this.#rediscoverAfter * 2, this.#refreshEvery);
           void this.#discover();
