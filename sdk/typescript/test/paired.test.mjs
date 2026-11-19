@@ -5,7 +5,9 @@
 // - never a silent downgrade to plaintext when the pairing does not match
 
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import net from "node:net";
+import tls from "node:tls";
 import { after, before, test } from "node:test";
 import {
   NexClient,
@@ -17,6 +19,8 @@ import {
   generateIdentity,
   normalizePublicKey,
   pairedKey,
+  pairingKey,
+  sendPairingRequest,
   tcpService,
 } from "../dist/node/index.js";
 import { runHost, startRelay, tcpClientRoundtrip, tcpEcho, waitFor, waitOnline } from "./helpers.mjs";
@@ -172,4 +176,56 @@ test("paired devices use the paired key on direct paths too", async () => {
   cleanups.push(closeServer(plain));
   assert.equal(await refused(plain.address().port), "closed");
   assert.match(plain.paths.status().error ?? "", /only accepts paired devices/);
+});
+
+test("pairing requests: whoever has the secret may knock, and do nothing else", async () => {
+  const shell = await tcpEcho("mini:");
+  cleanups.push(shell.close);
+  const secret = randomBytes(16);
+  const received = [];
+  const host = new PeerHost({
+    identity: generateIdentity(),
+    peers: [],
+    services: [tcpService("shell", shell.addr)],
+    listen: { addresses: ["127.0.0.1"], port: 0 },
+    pairing: {
+      secret,
+      onRequest: (payload) => {
+        received.push(payload);
+        return payload?.name === "spam" ? "too many requests" : null;
+      },
+    },
+  });
+  host.start();
+  cleanups.push(async () => host.stop());
+  await waitFor(() => host.endpoints.length === 1, { what: "peer listener" });
+  const eps = [{ host: "127.0.0.1", port: 9 }, ...host.endpoints]; // one dead address is fine
+
+  await sendPairingRequest(eps, secret, { name: "laptop", invite: "termany1.x" });
+  assert.deepEqual(received, [{ name: "laptop", invite: "termany1.x" }]);
+  await assert.rejects(sendPairingRequest(host.endpoints, secret, { name: "spam" }), /too many requests/);
+  await assert.rejects(sendPairingRequest(host.endpoints, randomBytes(16), { name: "x" }));
+  assert.equal(received.length, 2);
+
+  // A pairing connection asking for a service instead is refused.
+  const [ep] = host.endpoints;
+  const reply = await new Promise((resolve) => {
+    const sock = tls.connect({
+      host: ep.host,
+      port: ep.port,
+      minVersion: "TLSv1.2",
+      maxVersion: "TLSv1.2",
+      ciphers: "ECDHE-PSK-CHACHA20-POLY1305",
+      pskCallback: () => ({ psk: pairingKey(secret), identity: "nexpair:1" }),
+      checkServerIdentity: () => undefined,
+    });
+    sock.once("secureConnect", () => sock.write('{"service":"shell"}\n'));
+    sock.on("data", (d) => (sock.destroy(), resolve(d.toString())));
+    sock.on("error", (e) => resolve(`error ${e.message}`));
+  });
+  assert.match(reply, /may only ask to pair/);
+
+  // Closing pairing shuts the door.
+  host.updatePairing(null);
+  await assert.rejects(sendPairingRequest(host.endpoints, secret, { name: "late" }));
 });
