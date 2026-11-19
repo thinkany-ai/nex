@@ -113,6 +113,26 @@ const server = await forwardTcp(client, "vps", "ssh", { port: 2222 }); // host �
 // ssh -p 2222 127.0.0.1 ；不用了就 server.close()
 ```
 
+### 直连：局域网 / Tailscale 上不走中继
+
+两台设备在同一个局域网，或者在同一个 Tailscale tailnet 里时，可以不经过中继直接连，延迟从"到中继的往返 × 好几次"降到局域网的几毫秒，中继挂了也不影响。
+
+```ts
+// host 端打开直连（默认关）。true = 局域网 + Tailscale 地址，随机端口
+const host = new NexHost({ client, services: [tcpService("termany", "127.0.0.1:5174")], direct: true });
+// 也可以细调：{ lan: false }、{ tailscale: false }、{ addresses: ["100.64.1.2"], port: 7443 }
+
+// client 端：forwardTcp 默认就会尝试直连，失败自动走中继
+const server = await forwardTcp(client, "mini", "termany");
+server.paths?.status();   // { route: "direct" | "relay", endpoint, setupMs, relaySetupMs, paths: [...], error }
+server.paths?.on("change", (status) => { /* 在界面上显示当前走哪条链路 */ });
+```
+
+- **怎么选路**：client 先通过中继拿到对方的地址和密钥，然后每 15 秒探测一次每个地址的建连耗时，新连接走最快的那条。直连比中继慢一倍以上才改走中继（比如 tailnet 只能绕远处的 DERP）。直连失败的那个连接当场改走中继，不会报错。
+- **已建立的连接不迁移**：一条 TCP 连接建好后就留在原链路上；断开重连时才会选到新的最佳链路。
+- **安全**：直连用 TLS 1.2 PSK + ECDHE（有前向保密），密钥只通过中继发给同账号、已认证的设备，每台 client 一把，host 重启就全部换新。被吊销的设备在中继可达时 2 分钟内失去直连资格；中继连不上时，已经授权的设备继续直连，中继恢复后再复核。只监听私有地址（10/8、172.16/12、192.168/16、100.64/10、fd7a:115c:a1e0::/48），不会监听公网地址。
+- **限制**：只有本地是 TCP 端口的 `tcp` 服务能直连；`ws` / handler 服务照常走中继。浏览器不能直连（没有原始 TCP）。目前只有 TypeScript SDK 实现了直连，Rust / Go 的 host 不提供 `nex.direct`，client 会自动只走中继。
+
 ## 用法三：产品后端用 NexAdmin 给用户发设备凭证（corich、workany 等）
 
 admin key 只能放在服务端。同一个 `externalAccountId` 拿到的设备都在同一个 nex 账号下，不同产品之间也能互相访问。

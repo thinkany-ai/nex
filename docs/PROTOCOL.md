@@ -140,7 +140,30 @@ host 是暴露服务的一端，需要能设置请求头，所以不能是浏览
 
 测试工具约定使用一个名为 `echo`、类型为 `ws` 的服务：host 收到什么消息就原样发回去。Rust 的 `nex up --echo`、`nex ping` 和中继自带的测试网页都依赖这个约定。各 SDK 最好提供同样的内置实现。
 
-## 7. 兼容性
+## 7. 直连（可选扩展）
+
+两台设备能直接互通时（同一局域网、同一个 Tailscale tailnet），client 可以绕过中继直接连 host。中继本身不需要任何改动：直连的地址和密钥通过一条普通的中继流交换，所以鉴权仍然由中继负责。目前由 TypeScript SDK 实现（`NexHost` 的 `direct` 选项、`forwardTcp` / `DirectPaths`）。
+
+**发现**：提供直连的 host 在 Hello 里多暴露一个 `ws` 服务 `nex.direct`（保留名）。client 像打开其他服务一样打开它，host 回复一条 JSON 文本消息后关闭：
+
+```json
+{"v":1,"key":"<base64, 32 字节>","endpoints":[{"host":"100.64.1.2","port":51995,"kind":"tailscale"},{"host":"192.168.1.45","port":51994,"kind":"lan"}],"services":["ssh"]}
+```
+
+- `key` 是只给这台 client 的 PSK：`HMAC-SHA256(host 进程内随机主密钥, "nex-direct/v1/" + from_device_id)`。host 重启后主密钥换新，旧 key 全部失效。
+- `endpoints` 只包含私有地址：`10/8`、`172.16/12`、`192.168/16`（`lan`），`100.64/10`、`fd7a:115c:a1e0::/48`（`tailscale`），或配置里显式指定的地址（`custom`）。
+- `services` 是能直连的服务：只有本地目标是 TCP 端口的 `tcp` 服务。
+
+**连接**：
+
+1. client 用 TLS 1.2 连到某个 endpoint，密码套件只用 ECDHE-PSK（如 `ECDHE-PSK-CHACHA20-POLY1305`），PSK identity 是 `nex1:<client 的 device_id>`，PSK 是上面的 `key`。没有证书。
+2. host 只接受通过中继拿过 key 的 device_id。host 每 2 分钟用 `GET /v1/devices` 复核一次，不在列表里的（被吊销）立即移除；中继连不上时保留现有授权，等中继恢复后再复核。client 在中继连不上时也继续用上次拿到的 key 和地址。
+3. 握手成功后 client 发一行 JSON：`{"service":"ssh"}\n`（探测用 `{"probe":true}\n`）。
+4. host 回一行：`{"ok":true}\n` 之后两边就是原始 TCP 字节；或者 `{"ok":false,"error":"…"}\n` 后关闭。
+
+**选路**（SDK 行为，不属于线上协议）：client 每 15 秒探测每个 endpoint 的建连耗时，把它和"打开一条中继流"的耗时比较；直连不比中继慢一倍以上就走直连，否则走中继。直连失败时这条连接立即改走中继；所有 endpoint 都连不上、或者 PSK 被拒时，重新通过 `nex.direct` 拿地址和密钥。
+
+## 8. 兼容性
 
 - 增加字段、增加接口、增加关闭码，都不算破坏性变更，`protocol` 保持为 1。
 - 破坏性变更会把 `PROTOCOL_VERSION` 加 1，中继会在一段时间内同时支持新旧两个版本。
