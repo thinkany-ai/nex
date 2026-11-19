@@ -1,12 +1,30 @@
-# Relay + Caddy (automatic HTTPS). Set NEX_DOMAIN and NEX_ADMIN_KEY in .env.
+# Relay + Postgres + Caddy (automatic HTTPS).
+# Set NEX_DOMAIN and POSTGRES_PASSWORD in .env, then:
+#   docker compose up -d --build
+#   echo 'a-long-password' | docker compose exec -T nex nex-server user create you@example.com
 services:
   nex:
     build: ..
     restart: unless-stopped
     environment:
-      NEX_ADMIN_KEY: ${NEX_ADMIN_KEY:?set NEX_ADMIN_KEY}
+      NEX_DATABASE_URL: postgres://nex:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/nex?sslmode=disable
+      NEX_PUBLIC_URL: https://${NEX_DOMAIN:?set NEX_DOMAIN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: nex
+      POSTGRES_DB: nex
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "nex", "-d", "nex"]
+      interval: 5s
+      retries: 20
     volumes:
-      - nex-data:/var/lib/nex
+      - pg-data:/var/lib/postgresql/data
   caddy:
     image: caddy:2
     restart: unless-stopped
@@ -15,5 +33,5 @@ services:
     volumes:
       - caddy-data:/data
 volumes:
-  nex-data:
+  pg-data:
   caddy-data:

@@ -43,15 +43,20 @@ export async function waitFor(fn, { timeoutMs = 5000, intervalMs = 20, what = "c
   throw new Error(`timed out waiting for ${what}${lastErr ? `: ${lastErr.message}` : ""}`);
 }
 
-/** Starts `nex-server` on a free port with an in-memory DB. */
+export const TEST_DATABASE_URL = process.env.NEX_TEST_DATABASE_URL ?? "postgres://localhost:5432/nex_test";
+
+/** Starts `nex-server` on a free port with a fresh schema in the test database. */
 export async function startRelay({ adminKey } = {}) {
   if (!existsSync(NEX_SERVER)) {
     throw new Error(`${NEX_SERVER} not found: run \`cargo build --release\` in ${REPO}`);
   }
   for (let attempt = 0; attempt < 5; attempt++) {
     const port = await freePort();
-    const args = ["--listen", `127.0.0.1:${port}`, "--db", ":memory:"];
+    // Each relay gets its own schema in the test database.
+    const schema = `t_ts_${process.pid}_${Date.now()}_${attempt}`;
+    const args = ["--listen", `127.0.0.1:${port}`, "--database-url", TEST_DATABASE_URL, "--database-schema", schema];
     if (adminKey) args.push("--admin-key", adminKey);
+    else args.push("--open-bootstrap");
     const proc = spawn(NEX_SERVER, args, { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, RUST_LOG: "warn" } });
     let stderr = "";
     proc.stderr.on("data", (d) => (stderr += d));

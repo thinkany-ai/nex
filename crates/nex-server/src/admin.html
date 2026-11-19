@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nex 控制台</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #fff; --text: #16181d; --muted: #6b7280; --line: #e5e7eb;
+  --accent: #2563eb; --accent-ink: #fff; --danger: #dc2626; --ok: #16a34a; --code: #f3f4f6;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115; --panel: #171a21; --text: #e6e8ec; --muted: #9aa3af; --line: #272b35;
+    --accent: #3b82f6; --accent-ink: #fff; --danger: #f87171; --ok: #4ade80; --code: #1f232c;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+header { display: flex; align-items: center; gap: 20px; padding: 0 24px; height: 56px; background: var(--panel); border-bottom: 1px solid var(--line); }
+header .brand { font-weight: 700; font-size: 16px; letter-spacing: .3px; }
+header nav { display: flex; gap: 16px; flex: 1; }
+header nav a { color: var(--muted); }
+header nav a.on { color: var(--text); font-weight: 600; }
+header .me { color: var(--muted); font-size: 13px; display: flex; gap: 12px; align-items: center; }
+main { max-width: 1040px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+h2 { font-size: 15px; margin: 0 0 12px; }
+.sub { color: var(--muted); margin: 0 0 20px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; margin-bottom: 18px; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.spread { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+input, select { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px; min-width: 0; }
+input:focus, select:focus { outline: 2px solid color-mix(in srgb, var(--accent) 40%, transparent); border-color: var(--accent); }
+button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 7px; padding: 7px 14px; cursor: pointer; white-space: nowrap; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button.danger { color: var(--danger); }
+button.link { border: 0; background: none; padding: 0; color: var(--accent); }
+button:disabled { opacity: .5; cursor: default; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+tr:last-child td { border-bottom: 0; }
+.scroll { overflow-x: auto; }
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+code { background: var(--code); padding: 1px 5px; border-radius: 4px; }
+.muted { color: var(--muted); }
+.tag { display: inline-block; font-size: 12px; padding: 0 7px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); }
+.tag.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.tag.bad { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
+.secret { background: var(--code); border: 1px dashed var(--accent); border-radius: 8px; padding: 12px; margin: 10px 0; word-break: break-all; }
+.auth { max-width: 380px; margin: 10vh auto 0; }
+.auth input { width: 100%; margin-bottom: 10px; }
+.auth button { width: 100%; }
+.err { color: var(--danger); min-height: 1.4em; margin: 6px 0; }
+.toast { position: fixed; right: 16px; bottom: 16px; background: var(--text); color: var(--bg); padding: 9px 14px; border-radius: 8px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+.toast.on { opacity: .92; }
+.empty { color: var(--muted); padding: 18px 0; text-align: center; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+.stat b { display: block; font-size: 22px; }
+pre { background: var(--code); border-radius: 8px; padding: 12px; overflow-x: auto; margin: 8px 0 0; }
+@media (max-width: 640px) { header { padding: 0 16px; gap: 12px; } header .me span { display: none; } }
+</style>
+</head>
+<body>
+<header id="top" hidden>
+  <div class="brand">nex</div>
+  <nav id="nav"></nav>
+  <div class="me"><span id="me-email"></span><button class="link" id="logout">退出</button></div>
+</header>
+<main id="main"></main>
+<div class="toast" id="toast"></div>
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const when = (t) => t ? new Date(t * 1000).toLocaleString() : "—";
+let S = { user: null, csrf: "", signup: false };
+
+function toast(msg) {
+  const t = $("#toast"); t.textContent = msg; t.classList.add("on");
+  clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove("on"), 2200);
+}
+
+async function api(method, path, body) {
+  const headers = {};
+  if (body !== undefined) headers["content-type"] = "application/json";
+  if (method !== "GET") headers["x-csrf-token"] = S.csrf;
+  const res = await fetch("/admin/api" + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: "same-origin" });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && path !== "/login") { S.user = null; route(); throw new Error(data.error || "请先登录。"); }
+  if (!res.ok) throw new Error(data.error || `请求失败（${res.status}）`);
+  return data;
+}
+
+async function act(btn, fn) {
+  if (btn) btn.disabled = true;
+  try { await fn(); } catch (e) { toast(e.message); } finally { if (btn) btn.disabled = false; }
+}
+
+function copy(text) { navigator.clipboard?.writeText(text).then(() => toast("已复制"), () => toast("复制失败，请手动选择")); }
+
+// ---------- auth ----------
+
+function authView(mode) {
+  $("#top").hidden = true;
+  const signup = mode === "signup";
+  $("#main").innerHTML = `
+    <div class="auth panel">
+      <h1>${signup ? "注册 nex" : "登录 nex 控制台"}</h1>
+      <p class="sub">为需要组网的 agent 创建应用，管理密钥和设备。</p>
+      <form id="f">
+        <input name="email" type="email" placeholder="邮箱" autocomplete="email" required>
+        <input name="password" type="password" placeholder="密码（至少 8 位）" autocomplete="${signup ? "new-password" : "current-password"}" required>
+        <div class="err" id="err"></div>
+        <button class="primary">${signup ? "注册并登录" : "登录"}</button>
+      </form>
+      <p class="muted" style="margin:14px 0 0;text-align:center">
+        ${signup ? `已有账号？<a href="#/login">登录</a>` : S.signup ? `没有账号？<a href="#/signup">注册</a>` : "账号由管理员创建。"}
+      </p>
+    </div>`;
+  $("#f").onsubmit = (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    act(e.target.querySelector("button"), async () => {
+      try {
+        const r = await api("POST", signup ? "/signup" : "/login", { email: fd.get("email"), password: fd.get("password") });
+        S.user = r.user; S.csrf = r.csrf; location.hash = "#/apps"; route();
+      } catch (err) { $("#err").textContent = err.message; }
+    });
+  };
+}
+
+$("#logout").onclick = () => act(null, async () => { await api("POST", "/logout", {}); S.user = null; location.hash = "#/login"; route(); });
+
+function frame(active) {
+  $("#top").hidden = false;
+  $("#me-email").textContent = S.user.email + (S.user.role === "admin" ? "（管理员）" : "");
+  const links = [["apps", "应用"], ...(S.user.role === "admin" ? [["users", "用户"]] : []), ["account", "账号"], ["docs", "接入"]];
+  $("#nav").innerHTML = links.map(([k, v]) => `<a href="#/${k}" class="${k === active ? "on" : ""}">${v}</a>`).join("");
+}
+
+// ---------- apps ----------
+
+async function appsView() {
+  frame("apps");
+  $("#main").innerHTML = `<p class="muted">加载中…</p>`;
+  const { apps } = await api("GET", "/apps");
+  const admin = S.user.role === "admin";
+  $("#main").innerHTML = `
+    <h1>应用</h1>
+    <p class="sub">每个应用对应一个需要组网的 agent 产品。应用之间的账号和设备完全隔离。</p>
+    <div class="panel">
+      <form class="row" id="new">
+        <input name="name" placeholder="新应用名称，比如 dscode" maxlength="64" required style="flex:1;min-width:180px">
+        <button class="primary">创建应用</button>
+      </form>
+      <div id="created"></div>
+    </div>
+    <div class="panel scroll">
+      ${apps.length ? `<table>
+        <tr><th>名称</th><th>应用 ID</th>${admin ? "<th>所有者</th>" : ""}<th>账号</th><th>设备</th><th>状态</th><th>创建时间</th></tr>
+        ${apps.map((a) => `<tr>
+          <td><a href="#/apps/${esc(a.id)}">${esc(a.name)}</a>${a.builtin ? ' <span class="tag">内置</span>' : ""}</td>
+          <td class="mono">${esc(a.id)}</td>
+          ${admin ? `<td>${esc(a.owner_email || "—")}</td>` : ""}
+          <td>${a.accounts}</td><td>${a.devices}</td>
+          <td>${a.disabled ? '<span class="tag bad">已停用</span>' : '<span class="tag ok">启用</span>'}</td>
+          <td class="muted">${when(a.created_at)}</td></tr>`).join("")}
+      </table>` : `<div class="empty">还没有应用，先创建一个。</div>`}
+    </div>`;
+  $("#new").onsubmit = (e) => {
+    e.preventDefault();
+    const name = new FormData(e.target).get("name");
+    act(e.target.querySelector("button"), async () => {
+      const r = await api("POST", "/apps", { name });
+      showKey(r.key, `#/apps/${r.app.id}`);
+    });
+  };
+}
+
+function showKey(key, next) {
+  const box = document.createElement("div");
+  box.className = "panel";
+  box.innerHTML = `
+    <h2>应用密钥（只显示这一次）</h2>
+    <p class="muted" style="margin:0">请立即保存到产品后端的密钥管理里。丢失后只能新建密钥。</p>
+    <div class="secret mono" id="k">${esc(key)}</div>
+    <div class="row"><button class="primary" id="cp">复制</button>${next ? `<a href="${next}">我已保存，进入应用 →</a>` : `<button id="done">我已保存</button>`}</div>`;
+  $("#main").prepend(box);
+  $("#cp", box).onclick = () => copy(key);
+  const done = $("#done", box); if (done) done.onclick = () => route();
+  window.scrollTo(0, 0);
+}
+
+async function appView(id) {
+  frame("apps");
+  $("#main").innerHTML = `<p class="muted">加载中…</p>`;
+  const d = await api("GET", `/apps/${encodeURIComponent(id)}`);
+  const a = d.app;
+  const active = d.keys.filter((k) => !k.revoked_at);
+  const devices = d.accounts.reduce((n, x) => n + x.devices.length, 0);
+  const online = d.accounts.reduce((n, x) => n + x.devices.filter((v) => v.online).length, 0);
+  const base = location.origin;
+  $("#main").innerHTML = `
+    <p><a href="#/apps">← 应用</a></p>
+    <div class="spread"><div><h1>${esc(a.name)} ${a.disabled ? '<span class="tag bad">已停用</span>' : ""}</h1>
+      <p class="sub">应用 ID <code>${esc(a.id)}</code>${a.owner_email ? ` · 所有者 ${esc(a.owner_email)}` : ""} · 创建于 ${when(a.created_at)}</p></div></div>
+    <div class="panel grid">
+      <div class="stat"><span class="muted">账号</span><b>${d.accounts.length}${d.accounts.length >= d.accounts_limit ? "+" : ""}</b></div>
+      <div class="stat"><span class="muted">设备</span><b>${devices}</b></div>
+      <div class="stat"><span class="muted">在线</span><b>${online}</b></div>
+      <div class="stat"><span class="muted">有效密钥</span><b>${active.length} / 2</b></div>
+    </div>
+    <div class="panel">
+      <div class="spread"><h2>密钥</h2><button id="newkey" ${active.length >= 2 ? "disabled title='最多 2 个有效密钥'" : ""}>新建密钥</button></div>
+      <p class="muted" style="margin-top:0">产品后端用它调用 <code>/v1/admin/*</code> 给用户签发设备，或者在客户端「创建账号」时填入「中继管理密钥」。轮换：先新建，部署新密钥，再吊销旧的。</p>
+      ${d.legacy_key ? `<p class="muted">此内置应用还接受服务端环境变量 <code>NEX_ADMIN_KEY</code> 作为密钥。</p>` : ""}
+      <div class="scroll"><table>
+        <tr><th>名称</th><th>前缀</th><th>创建</th><th>最近使用</th><th>状态</th><th></th></tr>
+        ${d.keys.map((k) => `<tr>
+          <td>${esc(k.name || "—")}</td><td class="mono">${esc(k.prefix)}…</td>
+          <td class="muted">${when(k.created_at)}</td><td class="muted">${when(k.last_used_at)}</td>
+          <td>${k.revoked_at ? `<span class="tag bad">已吊销</span>` : '<span class="tag ok">有效</span>'}</td>
+          <td>${k.revoked_at ? "" : `<button class="danger" data-revoke-key="${esc(k.id)}">吊销</button>`}</td></tr>`).join("") || `<tr><td colspan="6" class="empty">没有密钥</td></tr>`}
+      </table></div>
+    </div>
+    <div class="panel">
+      <h2>账号与设备</h2>
+      <p class="muted" style="margin-top:0">账号是应用的一个终端用户，同一账号下的设备可以互相访问。显示最近 ${d.accounts_limit} 个账号。</p>
+      <div class="scroll"><table>
+        <tr><th>账号</th><th>设备</th><th>状态</th><th>服务</th><th>最近在线</th><th></th></tr>
+        ${d.accounts.map((acc) => {
+          const head = `<div>${esc(acc.name)}</div><div class="muted mono">${esc(acc.external_id || acc.id)}</div>`;
+          if (!acc.devices.length) return `<tr><td>${head}</td><td colspan="5" class="muted">没有有效设备</td></tr>`;
+          return acc.devices.map((v, i) => `<tr>
+            <td>${i === 0 ? head : ""}</td>
+            <td><div>${esc(v.name)}${v.app ? ` <span class="tag">${esc(v.app)}</span>` : ""}</div><div class="muted mono">${esc(v.id)}</div></td>
+            <td>${v.online ? '<span class="tag ok">在线</span>' : '<span class="tag">离线</span>'}</td>
+            <td>${v.services.map((s) => `<code>${esc(s.name)}</code>`).join(" ") || '<span class="muted">—</span>'}</td>
+            <td class="muted">${when(v.last_seen_at)}</td>
+            <td><button class="danger" data-revoke-dev="${esc(v.id)}" data-name="${esc(v.name)}">吊销</button></td></tr>`).join("");
+        }).join("") || `<tr><td colspan="6" class="empty">还没有设备接入。</td></tr>`}
+      </table></div>
+    </div>
+    <div class="panel">
+      <h2>接入示例</h2>
+      <p class="muted" style="margin-top:0">产品后端给登录用户签发一台设备（同一个 <code>external_account_id</code> 的设备在同一账号下互通）：</p>
+      <pre class="mono">curl -X POST ${esc(base)}/v1/admin/devices \\
+  -H "x-nex-admin-key: $NEX_APP_KEY" -H "content-type: application/json" \\
+  -d '{"external_account_id":"user-42","device_name":"macbook"}'</pre>
+      <p class="muted">或者在命令行：<code>nex init --server ${esc(base)} --account demo --name laptop --admin-key $NEX_APP_KEY</code></p>
+    </div>
+    <div class="panel">
+      <h2>设置</h2>
+      <form class="row" id="rename"><input name="name" value="${esc(a.name)}" maxlength="64" required style="flex:1;min-width:180px"><button>改名</button></form>
+      <div class="row" style="margin-top:14px">
+        <button id="toggle" class="${a.disabled ? "" : "danger"}">${a.disabled ? "启用应用" : "停用应用"}</button>
+        ${a.builtin ? "" : `<button id="del" class="danger">删除应用</button>`}
+      </div>
+      <p class="muted">停用后该应用的所有设备立即断开，密钥和设备凭证都会被拒绝；重新启用即可恢复。删除会永久删除所有账号和设备。</p>
+    </div>`;
+  const path = `/apps/${encodeURIComponent(a.id)}`;
+  $("#newkey").onclick = (e) => act(e.target, async () => {
+    const name = prompt("密钥名称（可选，比如 prod-2026-11）", "") ?? null;
+    if (name === null) return;
+    const r = await api("POST", `${path}/keys`, { name });
+    await appView(id); showKey(r.key);
+  });
+  document.querySelectorAll("[data-revoke-key]").forEach((b) => b.onclick = () => act(b, async () => {
+    if (!confirm("吊销后使用这个密钥的调用会立即失败。确定吊销？")) return;
+    await api("DELETE", `${path}/keys/${b.dataset.revokeKey}`); toast("已吊销"); appView(id);
+  }));
+  document.querySelectorAll("[data-revoke-dev]").forEach((b) => b.onclick = () => act(b, async () => {
+    if (!confirm(`吊销设备「${b.dataset.name}」？它会立即断开，凭证失效。`)) return;
+    await api("DELETE", `${path}/devices/${b.dataset.revokeDev}`); toast("已吊销"); appView(id);
+  }));
+  $("#rename").onsubmit = (e) => { e.preventDefault(); act(e.target.querySelector("button"), async () => {
+    await api("PATCH", path, { name: new FormData(e.target).get("name") }); toast("已保存"); appView(id);
+  }); };
+  $("#toggle").onclick = (e) => act(e.target, async () => {
+    if (!a.disabled && !confirm("停用后该应用的所有设备会立即断开。确定停用？")) return;
+    await api("PATCH", path, { disabled: !a.disabled }); appView(id);
+  });
+  const del = $("#del");
+  if (del) del.onclick = () => act(del, async () => {
+    const typed = prompt(`永久删除应用及其所有账号和设备。输入应用名称「${a.name}」确认：`);
+    if (typed !== a.name) return;
+    await api("DELETE", path); toast("已删除"); location.hash = "#/apps";
+  });
+}
+
+// ---------- users (administrators) ----------
+
+async function usersView() {
+  frame("users");
+  const d = await api("GET", "/users");
+  $("#main").innerHTML = `
+    <h1>用户</h1><p class="sub">控制台用户。成员只能看到自己创建的应用，管理员能看到全部。</p>
+    <div class="panel">
+      <label class="row"><input type="checkbox" id="signup" ${d.signup_open ? "checked" : ""}> 开放注册（任何人都可以注册成为成员）</label>
+    </div>
+    <div class="panel">
+      <h2>添加用户</h2>
+      <form class="row" id="add">
+        <input name="email" type="email" placeholder="邮箱" required style="flex:2;min-width:180px">
+        <input name="password" type="text" placeholder="初始密码（至少 8 位）" minlength="8" required style="flex:2;min-width:160px">
+        <select name="role"><option value="member">成员</option><option value="admin">管理员</option></select>
+        <button class="primary">添加</button>
+      </form>
+    </div>
+    <div class="panel scroll"><table>
+      <tr><th>邮箱</th><th>角色</th><th>应用</th><th>创建时间</th><th></th></tr>
+      ${d.users.map((u) => `<tr><td>${esc(u.email)}${u.id === S.user.id ? ' <span class="tag">我</span>' : ""}</td>
+        <td><select data-role="${esc(u.id)}"><option value="member" ${u.role === "member" ? "selected" : ""}>成员</option><option value="admin" ${u.role === "admin" ? "selected" : ""}>管理员</option></select></td>
+        <td>${u.apps}</td><td class="muted">${when(u.created_at)}</td>
+        <td>${u.id === S.user.id ? "" : `<button class="danger" data-del="${esc(u.id)}" data-email="${esc(u.email)}">删除</button>`}</td></tr>`).join("")}
+    </table></div>`;
+  $("#signup").onchange = (e) => act(null, async () => { await api("PUT", "/settings", { signup_open: e.target.checked }); toast("已保存"); });
+  $("#add").onsubmit = (e) => { e.preventDefault(); const fd = new FormData(e.target);
+    act(e.target.querySelector("button"), async () => {
+      await api("POST", "/users", { email: fd.get("email"), password: fd.get("password"), role: fd.get("role") }); toast("已添加"); usersView();
+    }); };
+  document.querySelectorAll("[data-role]").forEach((s) => s.onchange = () => act(null, async () => {
+    try { await api("PATCH", `/users/${s.dataset.role}`, { role: s.value }); toast("已保存"); } finally { usersView(); }
+  }));
+  document.querySelectorAll("[data-del]").forEach((b) => b.onclick = () => act(b, async () => {
+    if (!confirm(`删除用户 ${b.dataset.email}？他的所有应用、账号和设备都会被永久删除。`)) return;
+    await api("DELETE", `/users/${b.dataset.del}`); toast("已删除"); usersView();
+  }));
+}
+
+// ---------- my account ----------
+
+function accountView() {
+  frame("account");
+  $("#main").innerHTML = `
+    <h1>账号</h1><p class="sub">${esc(S.user.email)}</p>
+    <div class="panel" style="max-width:420px">
+      <h2>修改密码</h2>
+      <form id="pw">
+        <input name="current" type="password" placeholder="当前密码" autocomplete="current-password" required style="width:100%;margin-bottom:10px">
+        <input name="new" type="password" placeholder="新密码（至少 8 位）" autocomplete="new-password" minlength="8" required style="width:100%;margin-bottom:10px">
+        <button class="primary">保存</button>
+      </form>
+      <p class="muted">修改后其他浏览器上的登录会失效。</p>
+    </div>`;
+  $("#pw").onsubmit = (e) => { e.preventDefault(); const fd = new FormData(e.target);
+    act(e.target.querySelector("button"), async () => {
+      await api("POST", "/password", { current: fd.get("current"), new: fd.get("new") }); e.target.reset(); toast("密码已修改");
+    }); };
+}
+
+function docsView() {
+  frame("docs");
+  const base = location.origin;
+  $("#main").innerHTML = `
+    <h1>接入</h1><p class="sub">nex 让同一账号下的多台设备（电脑、服务器、手机、浏览器）互相访问对方暴露的服务。</p>
+    <div class="panel">
+      <h2>概念</h2>
+      <ul>
+        <li><b>应用</b>：一个需要组网的 agent 产品，在本控制台创建，拿到应用密钥（<code>nexk_…</code>）。</li>
+        <li><b>账号</b>：应用的一个终端用户。产品后端用自己的用户 ID 作为 <code>external_account_id</code>。</li>
+        <li><b>设备</b>：账号下的一台机器，持有设备凭证（<code>nexd_…</code>）。设备之间通过中继访问对方暴露的 <code>tcp</code> / <code>ws</code> 服务。</li>
+      </ul>
+    </div>
+    <div class="panel">
+      <h2>两种接入方式</h2>
+      <p><b>1. 产品后端签发设备（推荐）</b>：后端持有应用密钥，为登录用户签发设备凭证，再下发给客户端。</p>
+      <pre class="mono">POST ${esc(base)}/v1/admin/devices                          签发设备（账号不存在时自动创建）
+GET  ${esc(base)}/v1/admin/accounts/{external_id}/devices    列出用户的设备
+DELETE ${esc(base)}/v1/admin/accounts/{external_id}/devices/{device_id}   吊销
+请求头：x-nex-admin-key: nexk_…（或 Authorization: Bearer nexk_…）</pre>
+      <p><b>2. 客户端自行创建账号</b>：第一台设备用应用密钥调用 <code>POST /v1/bootstrap</code>（客户端界面里的「中继管理密钥」就填应用密钥），其他设备用配对码加入。</p>
+      <p class="muted">SDK（Rust / TypeScript / Go）和协议细节见仓库 <code>docs/INTEGRATION.md</code>、<code>docs/PROTOCOL.md</code>。</p>
+    </div>`;
+}
+
+// ---------- router ----------
+
+async function route() {
+  const h = location.hash.replace(/^#\/?/, "");
+  const [view, arg] = h.split("/");
+  if (!S.user) return authView(view === "signup" && S.signup ? "signup" : "login");
+  try {
+    if (view === "apps" && arg) return await appView(decodeURIComponent(arg));
+    if (view === "users" && S.user.role === "admin") return await usersView();
+    if (view === "account") return accountView();
+    if (view === "docs") return docsView();
+    if (view !== "apps") { location.hash = "#/apps"; return; }
+    return await appsView();
+  } catch (e) {
+    $("#main").innerHTML = `<div class="panel"><p class="err">${esc(e.message)}</p><a href="#/apps">返回应用</a></div>`;
+  }
+}
+
+window.addEventListener("hashchange", route);
+(async () => {
+  try {
+    const s = await (await fetch("/admin/api/session", { credentials: "same-origin" })).json();
+    S.user = s.user; S.csrf = s.csrf || ""; S.signup = !!s.signup_open;
+  } catch { /* shows the sign-in page */ }
+  route();
+})();
+</script>
+</body>
+</html>

@@ -1,7 +1,10 @@
 //! nex relay.
 //!
 //! Responsibilities:
-//! - account and device registry, pairing codes, device revocation (SQLite)
+//! - tenancy (Postgres): console users own apps, an app (one agent product)
+//!   owns accounts (its end users), an account owns devices
+//! - web console at `/admin`: apps, app keys, devices, users
+//! - account and device registry, pairing codes, device revocation
 //! - host control channel: devices that are online and what they expose
 //! - stream relay: splices a client WebSocket to a host WebSocket
 //!
@@ -15,20 +18,25 @@
 //!   | <========= bytes / messages spliced both ways =========> |
 //! ```
 
+pub mod console;
 pub mod db;
 
 mod api;
+mod cluster;
+mod peer;
 mod relay;
 mod util;
 
 use axum::{
+    middleware,
     routing::{delete, get, post},
     Router,
 };
-use nex_proto::{ServerMessage, ServiceInfo};
+use nex_proto::ServerMessage;
 use std::{
-    collections::HashMap,
-    sync::{atomic::AtomicU64, Arc, Mutex, MutexGuard},
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    sync::{Arc, Mutex, MutexGuard, Weak},
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -37,9 +45,16 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// When set, `POST /v1/bootstrap` requires this value in the
-    /// `x-nex-admin-key` header. Leave unset only for local development.
+    /// Legacy single key: when set, it is an extra app key of the built-in
+    /// default app. Products should use app keys from the console instead.
     pub admin_key: Option<String>,
+    /// Let `POST /v1/bootstrap` without any key create accounts in the
+    /// default app. Local development and tests only.
+    pub open_bootstrap: bool,
+    /// The console's public origin (`https://…`): console calls must come
+    /// from it, and https makes the session cookie Secure. None: the
+    /// request's own host is trusted (local development).
+    pub public_url: Option<String>,
     pub pairing_ttl: Duration,
     pub ticket_ttl: Duration,
     /// How long a client waits for the host to accept a stream.
@@ -50,34 +65,40 @@ pub struct Config {
     pub max_streams_per_device: usize,
     /// Largest WebSocket message accepted on any connection.
     pub max_message_bytes: usize,
+    /// Address advertised to other relay instances for private upgrades.
+    pub peer_addr: Option<SocketAddr>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             admin_key: None,
+            open_bootstrap: false,
+            public_url: None,
             pairing_ttl: Duration::from_secs(600),
             ticket_ttl: Duration::from_secs(60),
             open_timeout: Duration::from_secs(15),
             ping_interval: Duration::from_secs(20),
             max_streams_per_device: 128,
             max_message_bytes: 16 << 20,
+            peer_addr: None,
         }
     }
 }
 
 pub(crate) struct HostEntry {
-    pub conn_id: u64,
-    pub tx: mpsc::UnboundedSender<ServerMessage>,
-    pub services: Vec<ServiceInfo>,
+    pub conn_id: String,
+    pub tx: mpsc::Sender<ServerMessage>,
 }
 
 pub(crate) struct PendingStream {
     pub host_device_id: String,
+    pub host_conn_id: String,
     /// Ok(host socket) when the host accepts, Err(reason) when it rejects.
     pub tx: oneshot::Sender<Result<axum::extract::ws::WebSocket, String>>,
 }
 
+#[derive(sqlx::FromRow)]
 pub(crate) struct TicketEntry {
     pub from_device_id: String,
     pub target_device_id: String,
@@ -90,34 +111,12 @@ pub struct AppState {
     pub(crate) config: Config,
     pub(crate) hosts: Mutex<HashMap<String, HostEntry>>,
     pub(crate) pending: Mutex<HashMap<String, PendingStream>>,
-    /// Keyed by SHA-256 of the ticket.
-    pub(crate) tickets: Mutex<HashMap<String, TicketEntry>>,
-    /// One token per device; cancelled on revocation to drop its control
-    /// connection and every stream it is part of.
-    pub(crate) guards: Mutex<HashMap<String, CancellationToken>>,
-    /// Open streams per device, for `max_streams_per_device`.
-    pub(crate) streams: Mutex<HashMap<String, usize>>,
-    pub(crate) next_conn: AtomicU64,
-}
-
-/// Holds one stream slot on each of two devices; released on drop.
-pub(crate) struct StreamSlots {
-    state: Arc<AppState>,
-    devices: [String; 2],
-}
-
-impl Drop for StreamSlots {
-    fn drop(&mut self) {
-        let mut streams = lock(&self.state.streams);
-        for d in &self.devices {
-            if let Some(n) = streams.get_mut(d) {
-                *n = n.saturating_sub(1);
-                if *n == 0 {
-                    streams.remove(d);
-                }
-            }
-        }
-    }
+    pub(crate) instance_id: String,
+    pub(crate) closed_hosts: Mutex<HashSet<String>>,
+    pub(crate) closed_streams: Mutex<HashSet<String>>,
+    pub(crate) registration: tokio::sync::Mutex<()>,
+    /// Active local control channels and streams hold a strong reference.
+    pub(crate) guards: Mutex<HashMap<String, Weak<CancellationToken>>>,
 }
 
 impl AppState {
@@ -127,46 +126,34 @@ impl AppState {
             config,
             hosts: Mutex::default(),
             pending: Mutex::default(),
-            tickets: Mutex::default(),
+            instance_id: util::random_id("relay"),
+            closed_hosts: Mutex::default(),
+            closed_streams: Mutex::default(),
+            registration: tokio::sync::Mutex::default(),
             guards: Mutex::default(),
-            streams: Mutex::default(),
-            next_conn: AtomicU64::new(1),
         })
     }
 
-    pub(crate) fn guard(&self, device_id: &str) -> CancellationToken {
-        lock(&self.guards)
-            .entry(device_id.to_string())
-            .or_default()
-            .clone()
-    }
-
-    /// Reserves a stream slot on both devices, or None if either is at its limit.
-    pub(crate) fn acquire_streams(self: &Arc<Self>, a: &str, b: &str) -> Option<StreamSlots> {
-        let mut streams = lock(&self.streams);
-        let max = self.config.max_streams_per_device;
-        let used = |d: &str| streams.get(d).copied().unwrap_or(0);
-        let need_a = if a == b { 2 } else { 1 };
-        if used(a) + need_a > max || used(b) + 1 > max {
-            return None;
+    pub(crate) fn guard(&self, device_id: &str) -> Arc<CancellationToken> {
+        let mut guards = lock(&self.guards);
+        if let Some(token) = guards.get(device_id).and_then(Weak::upgrade) {
+            return token;
         }
-        *streams.entry(a.to_string()).or_default() += 1;
-        *streams.entry(b.to_string()).or_default() += 1;
-        Some(StreamSlots {
-            state: self.clone(),
-            devices: [a.to_string(), b.to_string()],
-        })
+        let token = Arc::new(CancellationToken::new());
+        guards.insert(device_id.to_string(), Arc::downgrade(&token));
+        token
     }
 
-    /// Drops everything live for a revoked device.
+    /// Disconnect locally immediately. Other replicas reconcile against Postgres.
     pub(crate) fn drop_device(&self, device_id: &str) {
-        if let Some(token) = lock(&self.guards).remove(device_id) {
+        if let Some(token) = lock(&self.guards)
+            .remove(device_id)
+            .and_then(|g| g.upgrade())
+        {
             token.cancel();
         }
         lock(&self.hosts).remove(device_id);
         lock(&self.pending).retain(|_, p| p.host_device_id != device_id);
-        lock(&self.tickets)
-            .retain(|_, t| t.from_device_id != device_id && t.target_device_id != device_id);
     }
 }
 
@@ -182,6 +169,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(|| async { axum::response::Html(include_str!("console.html")) }),
         )
         .route("/healthz", get(|| async { "ok" }))
+        .merge(console::routes())
         .route("/v1/bootstrap", post(api::bootstrap))
         .route("/v1/pairing-codes", post(api::create_pairing_code))
         .route("/v1/devices/claim", post(api::claim))
@@ -193,8 +181,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/tickets", post(api::create_ticket))
         .route("/v1/host", get(relay::host_ws))
-        .route("/v1/accept", get(relay::accept_ws))
-        .route("/v1/connect", get(relay::connect_ws))
+        .merge(
+            stream_routes().route_layer(middleware::from_fn_with_state(state.clone(), peer::route)),
+        )
         .route("/v1/admin/devices", post(api::admin_issue_device))
         .route(
             "/v1/admin/accounts/{external_id}/devices",
@@ -204,12 +193,59 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/admin/accounts/{external_id}/devices/{device_id}",
             delete(api::admin_revoke_device),
         )
-        // Bearer tokens, no cookies: permissive CORS lets web clients call the API.
+        // /v1 uses bearer tokens, no cookies: permissive CORS lets web
+        // clients call it. The console's cookie is never sent cross-site
+        // with credentials (CorsLayer::permissive does not allow them).
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
-pub async fn serve(listener: tokio::net::TcpListener, state: Arc<AppState>) -> std::io::Result<()> {
-    axum::serve(listener, router(state)).await
+fn stream_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/v1/accept", get(relay::accept_ws))
+        .route("/v1/connect", get(relay::connect_ws))
+}
+
+pub async fn serve(listener: tokio::net::TcpListener, state: Arc<AppState>) -> anyhow::Result<()> {
+    let peer = match state.config.peer_addr {
+        Some(addr) => {
+            let bind_ip = match addr.ip() {
+                std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            };
+            Some(tokio::net::TcpListener::bind((bind_ip, addr.port())).await?)
+        }
+        None => None,
+    };
+    serve_with_peer(listener, peer, state).await
+}
+
+/// Run the public listener and, in cluster mode, the private peer listener.
+pub async fn serve_with_peer(
+    listener: tokio::net::TcpListener,
+    peer: Option<tokio::net::TcpListener>,
+    state: Arc<AppState>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        peer.is_some() == state.config.peer_addr.is_some(),
+        "peer listener and address must be configured together"
+    );
+    if state.config.admin_key.is_some() || state.config.open_bootstrap {
+        state.db.ensure_default_app().await?;
+    }
+    state.renew_lease().await?;
+    let internal = async {
+        if let Some(peer) = peer {
+            axum::serve(peer, stream_routes().with_state(state.clone())).await
+        } else {
+            std::future::pending::<std::io::Result<()>>().await
+        }
+    };
+    tokio::select! {
+        result = axum::serve(listener, router(state.clone())) => result?,
+        result = internal => result?,
+        result = cluster::maintain(state.clone()) => result?,
+    }
+    Ok(())
 }

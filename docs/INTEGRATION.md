@@ -32,12 +32,14 @@ nex **只负责把字节和消息送到对端**，不关心你的业务协议。
 
 | 方式 | 适用场景 | 怎么做 |
 |---|---|---|
-| **A. 产品后端签发（推荐）** | 产品已经有登录体系，比如 dscode、workany、douchat | 用户登录后，产品后端用 admin key 调用 `POST /v1/admin/devices`，传入**自己的用户 ID**（`external_account_id`），拿到设备凭证后交给这台设备。同一个用户 ID 永远对应同一个 nex 账号 |
+| **A. 产品后端签发（推荐）** | 产品已经有登录体系，比如 dscode、workany、douchat | 用户登录后，产品后端用应用密钥调用 `POST /v1/admin/devices`，传入**自己的用户 ID**（`external_account_id`），拿到设备凭证后交给这台设备。同一个用户 ID 永远对应同一个 nex 账号 |
 | **B. 配对码** | 没有账号体系的工具，比如命令行工具，或者"扫码添加设备"这类场景 | 已登录的设备生成 `XXXX-XXXX` 配对码（也可以显示成二维码），新设备输入或扫码后加入 |
 
 两种方式可以同时用：主流程走 A，"扫码把手机加进来"走 B。
 
-**跨产品互通**：只要各产品传的 `external_account_id` 是同一个用户 ID（以后统一身份服务上线后，就是统一的用户 ID），同一个用户在 dscode 和 termany 里注册的设备就在同一个账号下，可以互相访问。
+**应用和隔离**：每个产品先在控制台 `/admin` 创建一个应用，拿到应用密钥（`nexk_…`，只显示一次，每个应用最多 2 个有效密钥，用于不停机轮换）。账号按应用隔离，不同应用之间看不到对方的账号和设备。
+
+**跨产品互通**：想让同一个用户在 dscode 和 termany 里的设备互相访问，就让两个产品用**同一个应用**的密钥，并传同一个 `external_account_id`（以后统一身份服务上线后，就是统一的用户 ID）。
 
 ### 2.2 设备怎么划分
 
@@ -228,9 +230,9 @@ http.newWebSocket(Request.Builder().url(wsUrl).build(), listener)
 ## 6. 产品后端：管理用户的设备（方式 A）
 
 ```ts
-// Node 后端。admin key 只能放在服务端！
+// Node 后端。应用密钥只能放在服务端！
 import { NexAdmin } from "nex-sdk/node";
-const nex = new NexAdmin({ server: "https://nex.example.com", adminKey: process.env.NEX_ADMIN_KEY });
+const nex = new NexAdmin({ server: "https://nex.example.com", adminKey: process.env.NEX_APP_KEY });
 
 // 用户在某台设备上登录后：
 const credential = await nex.issueDevice({
@@ -277,8 +279,8 @@ termany 要实现"手机和电脑同时操作同一个终端"，还需要在 ter
 
 ## 9. 上线检查清单
 
-- [ ] 中继放在 TLS 后面（`https://`、`wss://`），并且设置了 `NEX_ADMIN_KEY`
-- [ ] admin key 只出现在产品后端，没有打包进任何客户端
+- [ ] 中继放在 TLS 后面（`https://`、`wss://`），没有开 `--open-bootstrap`
+- [ ] 应用密钥只出现在产品后端，没有打包进任何客户端
 - [ ] 设备凭证存在 Keychain、Keystore 或者权限为 0600 的文件里，日志中不会打印
 - [ ] 每个上线的进程都有自己的设备，并且填了 `app`
 - [ ] host 遇到致命错误（401、4401、4409）时，会提示用户重新登录，而不是静默失败
@@ -303,13 +305,13 @@ termany 要实现"手机和电脑同时操作同一个终端"，还需要在 ter
 - **中继能看到明文**：TLS 只保护"设备到中继"这一段，中继进程本身能看到流的内容。敏感服务要么本身就是加密协议（比如 ssh），要么等端到端加密上线（路线图第 1 项）。**终端类产品对这一点最敏感。**
 - **凭证、配对码、票据只以 SHA-256 哈希保存。** 票据 60 秒有效，只能用一次；配对码 10 分钟有效，只能用一次。
 - **同一个账号内的设备可以访问彼此暴露的所有服务**，还没有按服务的访问控制。
-- **吊销立即生效**：被吊销设备的控制连接和相关的流都会被断开。
+- **吊销**：新的鉴权立即失效。已有控制连接和流会被断开，跨 Pod 通常在约 1 秒内完成。
 - **CORS 全开放**：鉴权用的是请求头里的 Bearer token，没有 cookie，所以不存在 CSRF 问题。
 - **限制**：
   - 每台设备最多 128 个并发流，单条消息最大 16 MiB。
   - 还没有按 IP 或账号的限流，上线时要在网关层加。
   - TCP 流不支持半关闭。
-  - 只能单实例部署，中继重启会断开正在进行的流（host 会自动重连）。
+  - Kubernetes 支持多副本。经由重启 Pod 的流需要重新打开，host 会自动重连。
 
 ## 12. 路线图
 

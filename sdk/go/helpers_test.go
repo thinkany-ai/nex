@@ -75,9 +75,13 @@ func startRelay(t *testing.T, adminKey string) string {
 	bin := binPath(t, "NEX_SERVER_BIN", "nex-server")
 	for attempt := 0; attempt < 5; attempt++ {
 		addr := freePort(t)
-		args := []string{"--listen", addr, "--db", ":memory:"}
+		// Each relay gets its own schema in the test database.
+		args := []string{"--listen", addr, "--database-url", testDatabaseURL(),
+			"--database-schema", fmt.Sprintf("t_go_%d_%d", time.Now().UnixNano(), attempt)}
 		if adminKey != "" {
 			args = append(args, "--admin-key", adminKey)
+		} else {
+			args = append(args, "--open-bootstrap")
 		}
 		cmd := exec.Command(bin, args...)
 		cmd.Env = append(cleanEnv(), "RUST_LOG=warn")
@@ -108,6 +112,14 @@ func startRelay(t *testing.T, adminKey string) string {
 }
 
 // cleanEnv is the environment without NEX_* variables.
+// testDatabaseURL is the Postgres database the test relays use.
+func testDatabaseURL() string {
+	if u := os.Getenv("NEX_TEST_DATABASE_URL"); u != "" {
+		return u
+	}
+	return "postgres://localhost:5432/nex_test"
+}
+
 func cleanEnv() []string {
 	var env []string
 	for _, kv := range os.Environ() {

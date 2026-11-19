@@ -11,20 +11,22 @@ nex 是给 agent 产品用的组网服务：让一个账号下的多台设备（
         │ ◀═════════════ 字节流或 WebSocket 消息双向转发 ═════════════════════▶ │
 ```
 
+- **应用（多租户）**：每个需要组网的 agent 产品在控制台 `/admin` 创建一个应用，拿到应用密钥（`nexk_…`）。应用之间的账号和设备完全隔离。
+- **账号**：应用的一个终端用户。产品后端用自己的用户 ID 映射成 nex 账号。
 - **设备**：账号下的每台设备都有自己的凭证。一台设备可以同时是被访问端（host）和访问端（client）。
 - **配对**：已登录设备生成一次性配对码 `XXXX-XXXX`（10 分钟有效），新设备用它加入账号。
 - **服务**：host 暴露的本地服务，两种类型：
   - `tcp`：原始字节流，适合 ssh、数据库、任意 TCP 协议。
   - `ws`：WebSocket 消息透传，适合 agl 这类 WebSocket 协议。浏览器可以直接用。
 - **票据（ticket）**：每打开一个流前，先用设备凭证换一张一次性票据（60 秒有效）。打开 WebSocket 时只需要把票据放在 URL 里，所以浏览器和手机都不需要自定义请求头。
-- **吊销**：吊销立即生效，被吊销设备的控制连接和它参与的所有流都会被断开。
+- **吊销**：吊销后立刻拒绝新的鉴权，已有的控制连接和流也会被断开。
 
 ## 目录
 
 | 路径 | 内容 |
 |---|---|
 | `crates/nex-proto` | 线上协议类型（JSON） |
-| `crates/nex-server` | 中继服务：账号和设备登记（SQLite）、配对、控制通道、流转发。可执行文件 `nex-server` |
+| `crates/nex-server` | 中继服务：多租户（Postgres）、控制台 `/admin`、配对、控制通道、流转发。可执行文件 `nex-server` |
 | `crates/nex` | Rust SDK（`NexClient`、`Host`、`NexAdmin`、`forward_tcp`）和命令行工具 `nex` |
 | `sdk/typescript` | TypeScript SDK：浏览器和 Node 通用的 client，Node 专用的 host 和 admin |
 | `sdk/go` | Go SDK：client、host、admin |
@@ -58,17 +60,22 @@ go get github.com/thinkany-ai/nex/sdk/go
 (cd sdk/typescript && npm install && npm run build)
 ```
 
-中继也可以用 Docker 部署（中继 + Caddy 自动 HTTPS）：在 `deploy/` 下的 `.env` 里设置 `NEX_DOMAIN` 和 `NEX_ADMIN_KEY`，然后 `cd deploy && docker compose up -d --build`，详见 `docs/DEPLOY.md`。
+中继需要 Postgres 15+。也可以用 Docker 部署（中继 + Postgres + Caddy 自动 HTTPS）：在 `deploy/` 下的 `.env` 里设置 `NEX_DOMAIN`，然后 `cd deploy && docker compose up -d --build`，也支持 Kubernetes 多副本，详见 `docs/DEPLOY.md`。
 
 ## 快速开始
 
 ```bash
 
 # 1. 启动中继（生产环境放在 TLS 反向代理后面，对外提供 https/wss）
-NEX_ADMIN_KEY=change-me ./target/release/nex-server --listen 127.0.0.1:8080 --db nex.db
+createdb nex
+export NEX_DATABASE_URL=postgres://localhost:5432/nex
+echo 'a-long-password' | ./target/release/nex-server user create you@example.com   # 第一个管理员
+./target/release/nex-server --listen 127.0.0.1:8080
+# 打开 http://127.0.0.1:8080/admin 登录，创建应用，拿到应用密钥 nexk_…
+# （也可以用命令行：nex-server app create --owner you@example.com --name demo）
 
 # 2. 电脑 A：创建账号，并暴露两个服务
-nex init --server http://127.0.0.1:8080 --account demo --name laptop --admin-key change-me
+nex init --server http://127.0.0.1:8080 --account demo --name laptop --admin-key nexk_…
 nex up --expose agl=ws://127.0.0.1:8790/ws --expose ssh=tcp://127.0.0.1:22
 
 # 3. 电脑 A 上另开一个终端，生成配对码
@@ -97,7 +104,8 @@ nex ping laptop -c 10         # 另一台设备：经过中继测往返延迟
 ## 开发
 
 ```bash
-cargo test     # 包含端到端测试：真实启动中继，三台设备互相访问 tcp 和 ws 服务，并覆盖配对、跨账号隔离、吊销
+createdb nex_test   # 测试用的库，每个测试在里面建自己的 schema；地址可用 NEX_TEST_DATABASE_URL 覆盖
+cargo test     # 包含端到端测试（多租户隔离和控制台流程见 crates/nex/tests/tenancy.rs）：真实启动中继，三台设备互相访问 tcp 和 ws 服务，并覆盖配对、跨账号隔离、吊销
 cargo clippy --all-targets
 
 # SDK 测试都会启动真实的中继，并和 Rust CLI 做互通测试，所以要先编译 release

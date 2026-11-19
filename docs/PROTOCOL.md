@@ -16,7 +16,7 @@
 |---|---|---|
 | 设备凭证 | 请求头 `Authorization: Bearer <device_token>` | 绝大部分 REST 接口；`/v1/host` 和 `/v1/accept` 两个 WebSocket |
 | 票据 | URL 参数 `?ticket=<ticket>` | 只用于 `/v1/connect`（浏览器开 WebSocket 时不能加请求头） |
-| admin key | 请求头 `x-nex-admin-key: <key>` | `/v1/admin/*`（产品后端）；以及中继配置了 key 时的 `/v1/bootstrap` |
+| 应用密钥 | 请求头 `x-nex-admin-key: nexk_…`（或 `Authorization: Bearer nexk_…`） | `/v1/admin/*`（产品后端）和 `/v1/bootstrap`。密钥在控制台 `/admin` 创建，决定请求作用于哪个应用 |
 | 配对码 | 请求体 | `/v1/devices/claim` |
 
 `device_token` 是长期有效的密钥，要像密码一样保存（Keychain、Keystore、权限为 0600 的文件），不要写进日志。
@@ -58,7 +58,7 @@
 | 方法 | 路径 | 鉴权 | 请求体 | 响应 |
 |---|---|---|---|---|
 | GET | `/healthz` | 无 | | 文本 `ok` |
-| POST | `/v1/bootstrap` | admin key（中继配置了时才需要） | `{account_name, device_name, app?}` | `DeviceCredential` |
+| POST | `/v1/bootstrap` | 应用密钥（中继以 `--open-bootstrap` 启动时可以不带，只用于开发） | `{account_name, device_name, app?}` | `DeviceCredential` |
 | POST | `/v1/devices/claim` | 配对码 | `{code, device_name, app?}` | `DeviceCredential` |
 | GET | `/v1/me` | Bearer | | `{account_id, device_id, device_name, app}` |
 | POST | `/v1/pairing-codes` | Bearer | 无 | `{code: "ABCD-EFGH", expires_at}` |
@@ -66,18 +66,18 @@
 | PATCH | `/v1/devices/{id}` | Bearer | `{name}` | `{ok: true}` |
 | DELETE | `/v1/devices/{id}` | Bearer | | `{ok: true}`，立即吊销 |
 | POST | `/v1/tickets` | Bearer | `{device, service}` | `Ticket` |
-| POST | `/v1/admin/devices` | admin key | `{external_account_id, account_name?, device_name, app?}` | `DeviceCredential` |
-| GET | `/v1/admin/accounts/{external_account_id}/devices` | admin key | | `{devices: [DeviceInfo]}`（`is_self` 都是 false） |
-| DELETE | `/v1/admin/accounts/{external_account_id}/devices/{id}` | admin key | | `{ok: true}` |
+| POST | `/v1/admin/devices` | 应用密钥 | `{external_account_id, account_name?, device_name, app?}` | `DeviceCredential` |
+| GET | `/v1/admin/accounts/{external_account_id}/devices` | 应用密钥 | | `{devices: [DeviceInfo]}`（`is_self` 都是 false） |
+| DELETE | `/v1/admin/accounts/{external_account_id}/devices/{id}` | 应用密钥 | | `{ok: true}` |
 
 说明：
 
 - **配对码**：格式 `XXXX-XXXX`，10 分钟有效，只能用一次。认领时忽略大小写和 `-`。
 - **吊销和改名**：只能操作同一账号下的设备，否则返回 404。可以吊销自己（相当于退出登录）。
 - **`/v1/tickets` 的 `device`**：可以是设备 id，也可以是账号内的设备名。名字重复时返回 409，这时要改用 id。设备离线或者没有暴露这个服务时返回 404。
-- **`/v1/admin/devices`**：按 `external_account_id` 查找账号，找不到就创建，然后在这个账号下注册一台新设备。产品后端用它把自己的用户映射成 nex 账号。同一个用户在不同产品里拿到的设备都在同一个 nex 账号下，所以可以互相访问。中继没有配置 admin key 时，`/v1/admin/*` 全部返回 403。路径里的 `external_account_id` 要做 URL 编码。
+- **`/v1/admin/devices`**：按 `external_account_id` 查找账号，找不到就创建，然后在这个账号下注册一台新设备。产品后端用它把自己的用户映射成 nex 账号。账号按应用隔离：`external_account_id` 只在本应用内唯一，别的应用用同一个 ID 得到的是另一个账号。想让几个产品的设备互通，就让它们用同一个应用的密钥。路径里的 `external_account_id` 要做 URL 编码。
 
-**状态码**：400 参数错误；401 凭证无效或已吊销（SDK 应该提示用户重新配对或登录）；403 admin key 不对；404 不存在或离线；409 设备名有歧义。
+**状态码**：400 参数错误；401 凭证无效或已吊销（SDK 应该提示用户重新配对或登录）；403 应用密钥缺失、错误、已吊销，或应用已停用；404 不存在或离线；409 设备名有歧义。
 
 ## 4. 打开一个流（client 端）
 

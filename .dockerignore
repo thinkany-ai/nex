@@ -3,3 +3,6 @@ target
 sdk/typescript/dist
 *.db*
 .git
+
+# macOS archive metadata is not part of the build context.
+**/._*

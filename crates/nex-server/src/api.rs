@@ -1,10 +1,10 @@
 //! REST endpoints.
 
 use crate::{
-    db::DeviceRow,
-    lock,
+    db::{AppRow, DeviceRow, DEFAULT_APP_ID},
+    cluster::OnlineHost,
     util::{hash_secret, normalize_code, now, random_secret},
-    AppState, HostEntry, TicketEntry,
+    AppState, TicketEntry,
 };
 use axum::{
     extract::{FromRequestParts, Path, State},
@@ -15,6 +15,7 @@ use axum::{
 use nex_proto::*;
 use std::{collections::HashMap, sync::Arc};
 
+#[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     message: String,
@@ -75,7 +76,8 @@ impl FromRequestParts<Arc<AppState>> for AuthDevice {
             .ok_or_else(ApiError::unauthorized)?;
         let device = state
             .db
-            .authenticate(token.trim())?
+            .authenticate(token.trim())
+            .await?
             .ok_or_else(ApiError::unauthorized)?;
         Ok(AuthDevice(device))
     }
@@ -101,34 +103,47 @@ fn clean_app(raw: Option<&str>) -> Result<Option<String>, ApiError> {
     }
 }
 
-fn admin_key_matches(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(expected) = &state.config.admin_key else {
-        return false;
+/// The app key a product backend sent: `x-nex-admin-key` (what the SDKs
+/// send) or `Authorization: Bearer nexk_…`.
+fn presented_key(headers: &HeaderMap) -> Option<&str> {
+    if let Some(key) = headers.get(ADMIN_KEY_HEADER).and_then(|v| v.to_str().ok()) {
+        return Some(key.trim());
+    }
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|k| k.starts_with("nexk_"))
+}
+
+/// Resolves the presented key to its app. `NEX_ADMIN_KEY`, when set, is an
+/// extra key of the built-in default app.
+async fn app_for_key(state: &AppState, key: &str) -> Result<Option<AppRow>, ApiError> {
+    if let Some(legacy) = &state.config.admin_key {
+        // Compare digests so the comparison time does not depend on the key.
+        if hash_secret(key) == hash_secret(legacy) {
+            return Ok(state.db.get_app(DEFAULT_APP_ID).await?.filter(|a| !a.disabled));
+        }
+    }
+    Ok(state.db.app_by_key(key).await?)
+}
+
+/// Guards `/v1/admin/*`: the caller's app, from its app key.
+async fn require_app(state: &AppState, headers: &HeaderMap) -> Result<AppRow, ApiError> {
+    let Some(key) = presented_key(headers) else {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "app key required"));
     };
-    let given = headers.get(ADMIN_KEY_HEADER).and_then(|v| v.to_str().ok());
-    // Compare digests so the comparison time does not depend on the key.
-    given.map(hash_secret) == Some(hash_secret(expected))
+    app_for_key(state, key)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::FORBIDDEN, "invalid or revoked app key"))
 }
 
-/// Guards `/v1/admin/*`: always needs the key, and is off without one.
-fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    if state.config.admin_key.is_none() {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "admin API disabled: start the relay with an admin key",
-        ));
-    }
-    if !admin_key_matches(state, headers) {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "admin key required"));
-    }
-    Ok(())
-}
-
-fn device_info(d: DeviceRow, hosts: &HashMap<String, HostEntry>, me: Option<&str>) -> DeviceInfo {
+pub(crate) fn device_info(d: DeviceRow, hosts: &HashMap<String, OnlineHost>, me: Option<&str>) -> DeviceInfo {
     let host = hosts.get(&d.id);
     DeviceInfo {
         online: host.is_some(),
-        services: host.map(|h| h.services.clone()).unwrap_or_default(),
+        services: host.map(|h| h.services.0.clone()).unwrap_or_default(),
         is_self: Some(d.id.as_str()) == me,
         id: d.id,
         name: d.name,
@@ -143,18 +158,22 @@ pub async fn bootstrap(
     headers: HeaderMap,
     Json(req): Json<BootstrapRequest>,
 ) -> Result<Json<DeviceCredential>, ApiError> {
-    // Open when the relay has no admin key (local development only).
-    if state.config.admin_key.is_some() && !admin_key_matches(&state, &headers) {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "admin key required"));
-    }
+    // The new account belongs to the app whose key was presented. Without a
+    // key, only a relay started with --open-bootstrap (local development)
+    // accepts it, into the default app.
+    let app_id = match presented_key(&headers) {
+        Some(_) => require_app(&state, &headers).await?.id,
+        None if state.config.open_bootstrap => DEFAULT_APP_ID.to_string(),
+        None => return Err(ApiError::new(StatusCode::FORBIDDEN, "app key required")),
+    };
     let account_name = clean_name(&req.account_name, "account_name")?;
     let device_name = clean_name(&req.device_name, "device_name")?;
     let app = clean_app(req.app.as_deref())?;
-    let (account_id, device_id, device_token) =
-        state
-            .db
-            .bootstrap(&account_name, &device_name, app.as_deref())?;
-    tracing::info!(%account_id, %device_id, "account bootstrapped");
+    let (account_id, device_id, device_token) = state
+        .db
+        .bootstrap(&app_id, &account_name, &device_name, app.as_deref())
+        .await?;
+    tracing::info!(%app_id, %account_id, %device_id, "account bootstrapped");
     Ok(Json(DeviceCredential {
         account_id,
         device_id,
@@ -167,7 +186,7 @@ pub async fn create_pairing_code(
     AuthDevice(me): AuthDevice,
 ) -> Result<Json<PairingCode>, ApiError> {
     let ttl = state.config.pairing_ttl.as_secs() as i64;
-    let (code, expires_at) = state.db.create_pairing_code(&me.account_id, &me.id, ttl)?;
+    let (code, expires_at) = state.db.create_pairing_code(&me.account_id, &me.id, ttl).await?;
     Ok(Json(PairingCode { code, expires_at }))
 }
 
@@ -180,7 +199,8 @@ pub async fn claim(
     let code = normalize_code(&req.code);
     let claimed = state
         .db
-        .claim_pairing_code(&code, &device_name, app.as_deref())?;
+        .claim_pairing_code(&code, &device_name, app.as_deref())
+        .await?;
     let Some((account_id, device_id, device_token)) = claimed else {
         return Err(ApiError::not_found(
             "invalid, used, or expired pairing code",
@@ -198,8 +218,8 @@ pub async fn list_devices(
     State(state): State<Arc<AppState>>,
     AuthDevice(me): AuthDevice,
 ) -> Result<Json<DeviceList>, ApiError> {
-    let rows = state.db.list_devices(&me.account_id)?;
-    let hosts = lock(&state.hosts);
+    let rows = state.db.list_devices(&me.account_id).await?;
+    let hosts = state.online_hosts(&rows).await?;
     let devices = rows
         .into_iter()
         .map(|d| device_info(d, &hosts, Some(&me.id)))
@@ -223,7 +243,7 @@ pub async fn rename_device(
     Json(req): Json<RenameRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let name = clean_name(&req.name, "name")?;
-    if !state.db.rename_device(&me.account_id, &device_id, &name)? {
+    if !state.db.rename_device(&me.account_id, &device_id, &name).await? {
         return Err(ApiError::not_found("no such device"));
     }
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -246,7 +266,7 @@ pub async fn admin_issue_device(
     headers: HeaderMap,
     Json(req): Json<IssueDeviceRequest>,
 ) -> Result<Json<DeviceCredential>, ApiError> {
-    require_admin(&state, &headers)?;
+    let app_row = require_app(&state, &headers).await?;
     let external_id = clean_external_id(&req.external_account_id)?;
     let account_name = clean_name(
         req.account_name.as_deref().unwrap_or(&external_id),
@@ -254,11 +274,17 @@ pub async fn admin_issue_device(
     )?;
     let device_name = clean_name(&req.device_name, "device_name")?;
     let app = clean_app(req.app.as_deref())?;
-    let (account_id, device_id, device_token) =
-        state
-            .db
-            .issue_device(&external_id, &account_name, &device_name, app.as_deref())?;
-    tracing::info!(%account_id, %device_id, "device issued by admin API");
+    let (account_id, device_id, device_token) = state
+        .db
+        .issue_device(
+            &app_row.id,
+            &external_id,
+            &account_name,
+            &device_name,
+            app.as_deref(),
+        )
+        .await?;
+    tracing::info!(app_id = %app_row.id, %account_id, %device_id, "device issued by admin API");
     Ok(Json(DeviceCredential {
         account_id,
         device_id,
@@ -266,10 +292,11 @@ pub async fn admin_issue_device(
     }))
 }
 
-fn external_account(state: &AppState, external_id: &str) -> Result<String, ApiError> {
+async fn external_account(state: &AppState, app_id: &str, external_id: &str) -> Result<String, ApiError> {
     state
         .db
-        .account_by_external_id(external_id)?
+        .account_by_external_id(app_id, external_id)
+        .await?
         .ok_or_else(|| ApiError::not_found("no such account"))
 }
 
@@ -278,10 +305,10 @@ pub async fn admin_list_devices(
     headers: HeaderMap,
     Path(external_id): Path<String>,
 ) -> Result<Json<DeviceList>, ApiError> {
-    require_admin(&state, &headers)?;
-    let account_id = external_account(&state, &external_id)?;
-    let rows = state.db.list_devices(&account_id)?;
-    let hosts = lock(&state.hosts);
+    let app = require_app(&state, &headers).await?;
+    let account_id = external_account(&state, &app.id, &external_id).await?;
+    let rows = state.db.list_devices(&account_id).await?;
+    let hosts = state.online_hosts(&rows).await?;
     let devices = rows
         .into_iter()
         .map(|d| device_info(d, &hosts, None))
@@ -294,9 +321,9 @@ pub async fn admin_revoke_device(
     headers: HeaderMap,
     Path((external_id, device_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state, &headers)?;
-    let account_id = external_account(&state, &external_id)?;
-    if !state.db.revoke_device(&account_id, &device_id)? {
+    let app = require_app(&state, &headers).await?;
+    let account_id = external_account(&state, &app.id, &external_id).await?;
+    if !state.db.revoke_device(&account_id, &device_id).await? {
         return Err(ApiError::not_found("no such device"));
     }
     state.drop_device(&device_id);
@@ -309,7 +336,7 @@ pub async fn revoke_device(
     AuthDevice(me): AuthDevice,
     Path(device_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if !state.db.revoke_device(&me.account_id, &device_id)? {
+    if !state.db.revoke_device(&me.account_id, &device_id).await? {
         return Err(ApiError::not_found("no such device"));
     }
     state.drop_device(&device_id);
@@ -322,7 +349,7 @@ pub async fn create_ticket(
     AuthDevice(me): AuthDevice,
     Json(req): Json<TicketRequest>,
 ) -> Result<Json<Ticket>, ApiError> {
-    let devices = state.db.list_devices(&me.account_id)?;
+    let devices = state.db.list_devices(&me.account_id).await?;
     let target = match devices.iter().find(|d| d.id == req.device) {
         Some(d) => d,
         None => {
@@ -344,11 +371,11 @@ pub async fn create_ticket(
     };
 
     let service = {
-        let hosts = lock(&state.hosts);
+        let hosts = state.online_hosts(&devices).await?;
         let host = hosts
             .get(&target.id)
             .ok_or_else(|| ApiError::not_found(format!("device '{}' is offline", target.name)))?;
-        host.services
+        host.services.0
             .iter()
             .find(|s| s.name == req.service)
             .cloned()
@@ -362,20 +389,15 @@ pub async fn create_ticket(
 
     let ticket = random_secret("next");
     let expires_at = now() + state.config.ticket_ttl.as_secs() as i64;
-    {
-        let mut tickets = lock(&state.tickets);
-        let t = now();
-        tickets.retain(|_, e| e.expires_at > t);
-        tickets.insert(
-            hash_secret(&ticket),
-            TicketEntry {
-                from_device_id: me.id.clone(),
-                target_device_id: target.id.clone(),
-                service: service.name.clone(),
-                expires_at,
-            },
-        );
-    }
+    state.insert_ticket(
+        &hash_secret(&ticket),
+        &TicketEntry {
+            from_device_id: me.id,
+            target_device_id: target.id.clone(),
+            service: service.name.clone(),
+            expires_at,
+        },
+    ).await?;
     Ok(Json(Ticket {
         path: format!("/v1/connect?ticket={ticket}"),
         ticket,

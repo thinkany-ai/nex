@@ -16,13 +16,13 @@ use axum::{
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use nex_proto::{close_code, valid_service_name, HostMessage, ServerMessage, ServiceInfo};
 use serde::Deserialize;
-use std::{
-    collections::HashSet,
-    sync::{atomic::Ordering, Arc},
-    time::Duration,
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+
+const HOST_QUEUE_CAPACITY: usize = 64;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ---------- host control channel ----------
 
@@ -62,21 +62,29 @@ async fn run_host(state: Arc<AppState>, device_id: String, mut socket: WebSocket
         return close(socket, close_code::BAD_REQUEST, &reason).await;
     }
 
-    let conn_id = state.next_conn.fetch_add(1, Ordering::Relaxed);
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    // A newer connection from the same device replaces the old one; dropping
-    // the old sender ends the old loop.
-    lock(&state.hosts).insert(
-        device_id.clone(),
-        HostEntry {
-            conn_id,
-            tx,
-            services,
-        },
-    );
+    let conn_id = random_id("conn");
+    let (tx, mut rx) = mpsc::channel(HOST_QUEUE_CAPACITY);
     let guard = state.guard(&device_id);
-    let _ = state.db.touch(&device_id);
-    tracing::info!(%device_id, conn_id, "host online");
+    {
+        let _registration = state.registration.lock().await;
+        match state.claim_host(&device_id, &conn_id, &services).await {
+            Ok(true) => {}
+            Ok(false) => return close(socket, close_code::REVOKED, "device revoked").await,
+            Err(err) => {
+                tracing::warn!(%err, "could not register host");
+                return;
+            }
+        }
+        lock(&state.hosts).insert(
+            device_id.clone(),
+            HostEntry {
+                conn_id: conn_id.clone(),
+                tx,
+            },
+        );
+    }
+    let _ = state.db.touch(&device_id).await;
+    tracing::info!(%device_id, %conn_id, "host online");
 
     let ready = ServerMessage::Ready {
         device_id: device_id.clone(),
@@ -93,9 +101,7 @@ async fn run_host(state: Arc<AppState>, device_id: String, mut socket: WebSocket
     while ok {
         tokio::select! {
             _ = guard.cancelled() => {
-                let _ = socket
-                    .send(close_msg(close_code::REVOKED, "device revoked"))
-                    .await;
+                send_close(&mut socket, close_msg(close_code::REVOKED, "device revoked")).await;
                 break;
             }
             out = rx.recv() => match out {
@@ -109,7 +115,7 @@ async fn run_host(state: Arc<AppState>, device_id: String, mut socket: WebSocket
                     } else {
                         (close_code::REPLACED, "another connection for this device took over")
                     };
-                    let _ = socket.send(close_msg(code, reason)).await;
+                    send_close(&mut socket, close_msg(code, reason)).await;
                     break;
                 }
             },
@@ -119,10 +125,9 @@ async fn run_host(state: Arc<AppState>, device_id: String, mut socket: WebSocket
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<HostMessage>(&text) {
                     Ok(HostMessage::Hello { services, .. }) => match validate_services(&services) {
                         Ok(()) => {
-                            if let Some(entry) = lock(&state.hosts).get_mut(&device_id) {
-                                if entry.conn_id == conn_id {
-                                    entry.services = services;
-                                }
+                            if let Err(err) = state.update_host(&device_id, &conn_id, &services).await {
+                                tracing::warn!(%err, "could not update host services");
+                                break;
                             }
                         }
                         Err(reason) => {
@@ -132,7 +137,7 @@ async fn run_host(state: Arc<AppState>, device_id: String, mut socket: WebSocket
                     },
                     Ok(HostMessage::Reject { stream_id, reason }) => {
                         let mut pending = lock(&state.pending);
-                        if pending.get(&stream_id).is_some_and(|p| p.host_device_id == device_id) {
+                        if pending.get(&stream_id).is_some_and(|p| p.host_device_id == device_id && p.host_conn_id == conn_id) {
                             if let Some(p) = pending.remove(&stream_id) {
                                 let _ = p.tx.send(Err(reason));
                             }
@@ -145,37 +150,34 @@ async fn run_host(state: Arc<AppState>, device_id: String, mut socket: WebSocket
             }},
             _ = ping.tick() => {
                 if last_heard.elapsed() > silence_limit {
-                    tracing::info!(%device_id, conn_id, "host silent, dropping");
+                    tracing::info!(%device_id, %conn_id, "host silent, dropping");
                     break;
                 }
-                ok = socket.send(Message::Ping(Default::default())).await.is_ok();
+                ok = send_frame(&mut socket, Message::Ping(Default::default()), WRITE_TIMEOUT).await;
             }
         }
     }
 
-    let went_offline = {
+    {
         let mut hosts = lock(&state.hosts);
-        let ours = hosts.get(&device_id).is_some_and(|h| h.conn_id == conn_id);
-        if ours {
+        if hosts.get(&device_id).is_some_and(|h| h.conn_id == conn_id) {
             hosts.remove(&device_id);
         }
-        ours
-    };
-    if went_offline {
-        // Streams still waiting for this host can no longer be accepted:
-        // dropping their senders tells each waiting client "offline" now
-        // instead of after the open timeout.
-        lock(&state.pending).retain(|_, p| p.host_device_id != device_id);
     }
-    let _ = state.db.touch(&device_id);
-    tracing::info!(%device_id, conn_id, "host offline");
+    lock(&state.pending).retain(|_, p| p.host_conn_id != conn_id);
+    if let Err(err) = state.release_host(&device_id, &conn_id).await {
+        lock(&state.closed_hosts).insert(conn_id.clone());
+        tracing::warn!(%err, "could not release host");
+    }
+    let _ = state.db.touch(&device_id).await;
+    tracing::info!(%device_id, %conn_id, "host offline");
 }
 
 // ---------- stream accept (host side) ----------
 
 #[derive(Deserialize)]
 pub struct AcceptQuery {
-    stream_id: String,
+    pub(crate) stream_id: String,
 }
 
 pub async fn accept_ws(
@@ -212,7 +214,7 @@ pub async fn accept_ws(
 
 #[derive(Deserialize)]
 pub struct ConnectQuery {
-    ticket: String,
+    pub(crate) ticket: String,
 }
 
 pub async fn connect_ws(
@@ -221,12 +223,13 @@ pub async fn connect_ws(
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     // Single use: removed whether or not the rest succeeds.
-    let entry = lock(&state.tickets)
-        .remove(&hash_secret(&q.ticket))
+    let entry = state
+        .consume_ticket(&hash_secret(&q.ticket))
+        .await?
         .ok_or_else(ApiError::unauthorized)?;
     if entry.expires_at <= now()
-        || !state.db.device_active(&entry.from_device_id)?
-        || !state.db.device_active(&entry.target_device_id)?
+        || !state.db.device_active(&entry.from_device_id).await?
+        || !state.db.device_active(&entry.target_device_id).await?
     {
         return Err(ApiError::unauthorized());
     }
@@ -234,47 +237,101 @@ pub async fn connect_ws(
 }
 
 async fn run_client(state: Arc<AppState>, entry: TicketEntry, socket: WebSocket) {
-    let Some(_slots) = state.acquire_streams(&entry.from_device_id, &entry.target_device_id) else {
-        return close(socket, close_code::BUSY, "too many open streams").await;
+    let stream_id = random_id("str");
+    let a = state.guard(&entry.from_device_id);
+    let b = state.guard(&entry.target_device_id);
+    match state.reserve_stream(&stream_id, &entry).await {
+        Ok(true) => {}
+        Ok(false) => return close(socket, close_code::BUSY, "too many open streams").await,
+        Err(err) => {
+            tracing::warn!(%err, "could not reserve stream");
+            return close(socket, close_code::OFFLINE, "relay unavailable").await;
+        }
+    }
+    relay_stream(&state, &entry, &stream_id, socket, &a, &b).await;
+    if let Err(err) = state.release_stream(&stream_id).await {
+        lock(&state.closed_streams).insert(stream_id);
+        tracing::warn!(%err, "could not release stream reservation");
+    }
+}
+
+async fn relay_stream(
+    state: &AppState,
+    entry: &TicketEntry,
+    stream_id: &str,
+    socket: WebSocket,
+    a: &CancellationToken,
+    b: &CancellationToken,
+) {
+    let owner = match state.local_host_connection(&entry.target_device_id).await {
+        Ok(Some(owner)) => owner,
+        Ok(None) => return close(socket, close_code::OFFLINE, "device offline").await,
+        Err(err) => {
+            tracing::warn!(%err, "could not look up host owner");
+            return close(socket, close_code::OFFLINE, "relay unavailable").await;
+        }
     };
-    let host_tx = lock(&state.hosts)
-        .get(&entry.target_device_id)
-        .map(|h| h.tx.clone());
-    let Some(host_tx) = host_tx else {
+    let local_host = || {
+        lock(&state.hosts)
+            .get(&entry.target_device_id)
+            .filter(|host| host.conn_id == owner)
+            .map(|host| (host.conn_id.clone(), host.tx.clone()))
+    };
+    let host = match local_host() {
+        Some(host) => Some(host),
+        None => {
+            // The owner may have committed its claim and be about to insert
+            // the local sender. Wait only on this registration slow path.
+            let _registration = state.registration.lock().await;
+            local_host()
+        }
+    };
+    let Some((host_conn_id, host_tx)) = host else {
         return close(socket, close_code::OFFLINE, "device offline").await;
     };
 
-    let stream_id = random_id("str");
     let (tx, rx) = oneshot::channel();
     lock(&state.pending).insert(
-        stream_id.clone(),
+        stream_id.to_owned(),
         PendingStream {
             host_device_id: entry.target_device_id.clone(),
+            host_conn_id,
             tx,
         },
     );
     let open = ServerMessage::Open {
-        stream_id: stream_id.clone(),
+        stream_id: stream_id.to_owned(),
         service: entry.service.clone(),
         from_device_id: entry.from_device_id.clone(),
     };
-    if host_tx.send(open).is_err() {
-        lock(&state.pending).remove(&stream_id);
-        return close(socket, close_code::OFFLINE, "device offline").await;
+    let sent = host_tx.try_send(open);
+    drop(host_tx);
+    if let Err(error) = sent {
+        lock(&state.pending).remove(stream_id);
+        let (code, reason) = match error {
+            mpsc::error::TrySendError::Full(_) => {
+                (close_code::BUSY, "device control queue is full")
+            }
+            mpsc::error::TrySendError::Closed(_) => (close_code::OFFLINE, "device offline"),
+        };
+        return close(socket, code, reason).await;
     }
 
-    match tokio::time::timeout(state.config.open_timeout, rx).await {
-        Ok(Ok(Ok(host_socket))) => {
-            let a = state.guard(&entry.from_device_id);
-            let b = state.guard(&entry.target_device_id);
+    let accepted = tokio::select! {
+        result = tokio::time::timeout(state.config.open_timeout, rx) => Some(result),
+        _ = a.cancelled() => None,
+        _ = b.cancelled() => None,
+    };
+    lock(&state.pending).remove(stream_id);
+    match accepted {
+        Some(Ok(Ok(Ok(host_socket)))) => {
             tracing::debug!(%stream_id, service = %entry.service, "stream open");
             splice(socket, host_socket, a, b).await;
             tracing::debug!(%stream_id, "stream closed");
         }
-        Ok(Ok(Err(reason))) => close(socket, close_code::REJECTED, &reason).await,
-        Ok(Err(_)) => close(socket, close_code::OFFLINE, "device went offline").await,
-        Err(_) => {
-            lock(&state.pending).remove(&stream_id);
+        Some(Ok(Ok(Err(reason)))) => close(socket, close_code::REJECTED, &reason).await,
+        Some(Ok(Err(_))) => close(socket, close_code::OFFLINE, "device went offline").await,
+        Some(Err(_)) => {
             close(
                 socket,
                 close_code::TIMEOUT,
@@ -282,6 +339,7 @@ async fn run_client(state: Arc<AppState>, entry: TicketEntry, socket: WebSocket)
             )
             .await
         }
+        None => close(socket, close_code::REVOKED, "device revoked").await,
     }
 }
 
@@ -298,7 +356,7 @@ where
             // Keepalives are per-hop; do not forward them.
             Message::Ping(_) | Message::Pong(_) => {}
             data => {
-                if tx.send(data).await.is_err() {
+                if !send_frame(tx, data, WRITE_TIMEOUT).await {
                     break;
                 }
             }
@@ -307,7 +365,7 @@ where
 }
 
 /// Forwards frames both ways until either side closes or either device is revoked.
-async fn splice(client: WebSocket, host: WebSocket, a: CancellationToken, b: CancellationToken) {
+async fn splice(client: WebSocket, host: WebSocket, a: &CancellationToken, b: &CancellationToken) {
     let (mut client_tx, mut client_rx) = client.split();
     let (mut host_tx, mut host_rx) = host.split();
     tokio::select! {
@@ -316,8 +374,10 @@ async fn splice(client: WebSocket, host: WebSocket, a: CancellationToken, b: Can
         _ = a.cancelled() => {}
         _ = b.cancelled() => {}
     }
-    let _ = client_tx.send(Message::Close(None)).await;
-    let _ = host_tx.send(Message::Close(None)).await;
+    tokio::join!(
+        send_close(&mut client_tx, Message::Close(None)),
+        send_close(&mut host_tx, Message::Close(None)),
+    );
 }
 
 fn limit(ws: WebSocketUpgrade, state: &AppState) -> WebSocketUpgrade {
@@ -347,20 +407,52 @@ pub(crate) fn truncate_reason(reason: &str) -> &str {
     &reason[..end]
 }
 
+async fn send_frame<S: Sink<Message> + Unpin>(
+    sink: &mut S,
+    frame: Message,
+    timeout: Duration,
+) -> bool {
+    matches!(
+        tokio::time::timeout(timeout, sink.send(frame)).await,
+        Ok(Ok(()))
+    )
+}
+
+async fn send_close<S: Sink<Message> + Unpin>(sink: &mut S, frame: Message) {
+    send_frame(sink, frame, CLOSE_TIMEOUT).await;
+}
+
 async fn close(mut socket: WebSocket, code: u16, reason: &str) {
-    let _ = socket.send(close_msg(code, reason)).await;
+    send_close(&mut socket, close_msg(code, reason)).await;
 }
 
 async fn send_json<T: serde::Serialize>(socket: &mut WebSocket, msg: &T) -> bool {
     match serde_json::to_string(msg) {
-        Ok(text) => socket.send(Message::Text(text.into())).await.is_ok(),
+        Ok(text) => send_frame(socket, Message::Text(text.into()), WRITE_TIMEOUT).await,
         Err(_) => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_reason;
+    use super::{send_frame, truncate_reason};
+    use axum::extract::ws::Message;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn stalled_socket_write_has_a_deadline() {
+        let mut stalled = futures_util::sink::unfold((), |(), _: Message| {
+            Box::pin(std::future::pending::<Result<(), std::io::Error>>())
+        });
+        assert!(
+            !send_frame(
+                &mut stalled,
+                Message::Close(None),
+                Duration::from_millis(20)
+            )
+            .await
+        );
+    }
 
     #[test]
     fn reasons_fit_in_a_close_frame() {

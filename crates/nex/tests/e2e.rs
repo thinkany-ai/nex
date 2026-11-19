@@ -15,8 +15,11 @@ use tokio_util::sync::CancellationToken;
 
 async fn start_relay() -> String {
     let state = nex_server::AppState::new(
-        nex_server::db::Db::open(":memory:").unwrap(),
-        nex_server::Config::default(),
+        nex_server::db::Db::connect_for_test().await.unwrap(),
+        nex_server::Config {
+            open_bootstrap: true,
+            ..Default::default()
+        },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -368,7 +371,10 @@ async fn host_reports_dead_local_service_and_reconnect_replaces_session() {
 }
 
 async fn start_relay_with(config: nex_server::Config) -> String {
-    let state = nex_server::AppState::new(nex_server::db::Db::open(":memory:").unwrap(), config);
+    let state = nex_server::AppState::new(
+        nex_server::db::Db::connect_for_test().await.unwrap(),
+        config,
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(nex_server::serve(listener, state));
@@ -463,6 +469,7 @@ async fn product_backend_issues_devices_for_its_users() {
 async fn admin_api_is_off_without_a_key_and_streams_are_capped() {
     let relay = start_relay_with(nex_server::Config {
         max_streams_per_device: 2,
+        open_bootstrap: true,
         ..Default::default()
     })
     .await;
@@ -609,6 +616,7 @@ async fn freezable_proxy(
 async fn relay_drops_a_host_that_went_silent() {
     let relay = start_relay_with(nex_server::Config {
         ping_interval: Duration::from_millis(100),
+        open_bootstrap: true,
         ..Default::default()
     })
     .await;
@@ -656,4 +664,158 @@ async fn relay_drops_a_host_that_went_silent() {
     assert!(offline, "relay still lists the silent host as online");
     assert_eq!(status_of(b.ticket("a", "echo").await.unwrap_err()), 404);
     stop.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clustered_relays_route_all_handshakes_and_enforce_global_limits() {
+    use nex::proto::{close_code, HostMessage, ServerMessage, ServiceInfo, ServiceKind};
+    use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
+
+    async fn relay(db: nex_server::db::Db) -> String {
+        let public = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", public.local_addr().unwrap());
+        let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = nex_server::Config {
+            open_bootstrap: true,
+            peer_addr: Some(peer.local_addr().unwrap()),
+            max_streams_per_device: 1,
+            ..Default::default()
+        };
+        tokio::spawn(nex_server::serve_with_peer(
+            public,
+            Some(peer),
+            nex_server::AppState::new(db, config),
+        ));
+        base
+    }
+
+    let db = nex_server::db::Db::connect_for_test().await.unwrap();
+    let a = relay(db.clone()).await;
+    let b = relay(db.clone()).await;
+    let c = relay(db).await;
+    let host_credential = NexClient::bootstrap(&a, "acct", "host", None, None)
+        .await
+        .unwrap();
+    let host_client = NexClient::new(&a, host_credential.clone()).unwrap();
+    let code = host_client.create_pairing_code().await.unwrap();
+    let credentials = NexClient::claim(&b, &code.code, "client", None)
+        .await
+        .unwrap();
+    let client = NexClient::new(&b, credentials).unwrap();
+
+    let auth_request = |base: &str, path: &str| {
+        let mut request = format!("{}{path}", base.replacen("http:", "ws:", 1))
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {}", host_credential.device_token)
+                .parse()
+                .unwrap(),
+        );
+        request
+    };
+    let hello = Message::Text(
+        serde_json::to_string(&HostMessage::Hello {
+            protocol: 1,
+            services: vec![ServiceInfo {
+                name: "echo".into(),
+                kind: ServiceKind::Ws,
+            }],
+        })
+        .unwrap()
+        .into(),
+    );
+    let (mut control, _) = connect_async(auth_request(&a, "/v1/host")).await.unwrap();
+    control.send(hello.clone()).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<ServerMessage>(
+            control.next().await.unwrap().unwrap().to_text().unwrap()
+        )
+        .unwrap(),
+        ServerMessage::Ready { .. }
+    ));
+    wait_online(&client, host_client.device_id()).await;
+
+    // Ticket on B, /connect and /accept on C, host control on A.
+    let ticket = client
+        .ticket(host_client.device_id(), "echo")
+        .await
+        .unwrap();
+    let url = format!("{}{}", c.replacen("http:", "ws:", 1), ticket.path);
+    let (mut stream, _) = connect_async(&url).await.unwrap();
+    let open = control.next().await.unwrap().unwrap();
+    let ServerMessage::Open { stream_id, .. } =
+        serde_json::from_str(open.to_text().unwrap()).unwrap()
+    else {
+        panic!("expected Open, got {open:?}");
+    };
+    let (mut host_stream, _) = connect_async(auth_request(
+        &c,
+        &format!("/v1/accept?stream_id={stream_id}"),
+    ))
+    .await
+    .unwrap();
+
+    let error = connect_async(&url).await.unwrap_err();
+    assert!(
+        matches!(error, tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status() == 401)
+    );
+
+    stream.send(Message::Text("跨 Pod".into())).await.unwrap();
+    assert_eq!(
+        host_stream.next().await.unwrap().unwrap(),
+        Message::Text("跨 Pod".into())
+    );
+    host_stream
+        .send(Message::Binary(vec![0, 255, 16].into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        stream.next().await.unwrap().unwrap(),
+        Message::Binary(vec![0, 255, 16].into())
+    );
+
+    // Move the same host to B. The first stream still counts against B's
+    // device quota even though A owns the established WebSockets.
+    let (mut replacement, _) = connect_async(auth_request(&b, "/v1/host")).await.unwrap();
+    replacement.send(hello).await.unwrap();
+    let _ = replacement.next().await.unwrap().unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(4), control.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(frame, Message::Close(Some(f)) if u16::from(f.code) == close_code::REPLACED));
+
+    let mut busy = client
+        .connect(host_client.device_id(), "echo")
+        .await
+        .unwrap();
+    assert!(
+        matches!(busy.next().await.unwrap().unwrap(), Message::Close(Some(f)) if u16::from(f.code) == close_code::BUSY)
+    );
+
+    // Revoke from C, where neither the replacement control socket nor
+    // the established splice is running.
+    let revoker = NexClient::new(&c, host_credential).unwrap();
+    revoker.revoke(host_client.device_id()).await.unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(4), replacement.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(frame, Message::Close(Some(f)) if u16::from(f.code) == close_code::REVOKED));
+    let frame = tokio::time::timeout(Duration::from_secs(4), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame, Message::Close(None));
+    assert!(client
+        .devices()
+        .await
+        .unwrap()
+        .iter()
+        .all(|d| d.id != host_client.device_id()));
 }
