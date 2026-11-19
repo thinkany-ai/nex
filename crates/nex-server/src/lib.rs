@@ -29,6 +29,7 @@ mod util;
 
 use axum::{
     middleware,
+    serve::ListenerExt,
     routing::{delete, get, post},
     Router,
 };
@@ -235,15 +236,22 @@ pub async fn serve_with_peer(
         state.db.ensure_default_app().await?;
     }
     state.renew_lease().await?;
+    // Streams carry interactive traffic (keystrokes, TLS handshakes): never
+    // let Nagle hold a small write back waiting for a delayed ACK.
+    let nodelay = |tcp: &mut tokio::net::TcpStream| {
+        if let Err(err) = tcp.set_nodelay(true) {
+            tracing::debug!(%err, "could not set TCP_NODELAY");
+        }
+    };
     let internal = async {
         if let Some(peer) = peer {
-            axum::serve(peer, stream_routes().with_state(state.clone())).await
+            axum::serve(peer.tap_io(nodelay), stream_routes().with_state(state.clone())).await
         } else {
             std::future::pending::<std::io::Result<()>>().await
         }
     };
     tokio::select! {
-        result = axum::serve(listener, router(state.clone())) => result?,
+        result = axum::serve(listener.tap_io(nodelay), router(state.clone())) => result?,
         result = internal => result?,
         result = cluster::maintain(state.clone()) => result?,
     }

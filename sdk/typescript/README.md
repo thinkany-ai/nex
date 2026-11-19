@@ -133,6 +133,25 @@ server.paths?.on("change", (status) => { /* 在界面上显示当前走哪条链
 - **安全**：直连用 TLS 1.2 PSK + ECDHE（有前向保密），密钥只通过中继发给同账号、已认证的设备，每台 client 一把，host 重启就全部换新。被吊销的设备在中继可达时 2 分钟内失去直连资格；中继连不上时，已经授权的设备继续直连，中继恢复后再复核。只监听私有地址（10/8、172.16/12、192.168/16、100.64/10、fd7a:115c:a1e0::/48），不会监听公网地址。
 - **限制**：只有本地是 TCP 端口的 `tcp` 服务能直连；`ws` / handler 服务照常走中继。浏览器不能直连（没有原始 TCP）。目前只有 TypeScript SDK 实现了直连，Rust / Go 的 host 不提供 `nex.direct`，client 会自动只走中继。
 
+### 配对设备：密钥不经过中继，或者完全不用中继
+
+```ts
+import { generateIdentity, fingerprint, NexHost, PeerHost, forwardTcp, forwardPeer } from "nex-sdk/node";
+
+const me = generateIdentity();            // 存到 0600 文件 / Keychain；me.publicKey 可以公开
+fingerprint(me.publicKey);                // "K7QM-2XFD-…"，让用户在两台设备上核对
+
+// 1) 有中继：配对设备端到端加密（直连或经 nex.e2e），strict 时其他设备进不来
+new NexHost({ client, services, direct: true, trust: { identity: me, peers: [laptopKey], strict: true } });
+await forwardTcp(client, "mini", "termany", { trust: { identity: me, peer: miniKey } });
+
+// 2) 没有中继、没有账号：局域网 / Tailscale 直连，host 固定监听 47428
+new PeerHost({ identity: me, peers: [laptopKey], services }).start();
+await forwardPeer([{ host: "100.109.224.114", port: 47428 }], { identity: me, peer: miniKey }, "termany");
+```
+
+配了 `trust` 的连接对方不认就直接失败，不会退回明文。协议见 `docs/PROTOCOL.md` 7.1 节。
+
 ## 用法三：产品后端用 NexAdmin 给用户发设备凭证（corich、workany 等）
 
 admin key 只能放在服务端。同一个 `externalAccountId` 拿到的设备都在同一个 nex 账号下，不同产品之间也能互相访问。
